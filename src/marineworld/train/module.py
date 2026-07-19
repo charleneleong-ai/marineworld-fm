@@ -1,0 +1,73 @@
+"""Lightning module for VideoMAE masked-reconstruction pretraining."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+import torch
+from pytorch_lightning import LightningModule
+
+from marineworld.models.videomae import build_videomae, tube_mask
+
+__all__ = ["VideoMAEPretrainingModule"]
+
+
+class VideoMAEPretrainingModule(LightningModule):
+    """Optimize VideoMAE reconstruction with deterministic per-step masking."""
+
+    def __init__(
+        self,
+        model_config: Mapping[str, Any],
+        *,
+        lr: float = 1.5e-4,
+        weight_decay: float = 0.05,
+        seed: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.model_config = dict(model_config)
+        self.model = build_videomae(self.model_config)
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.mask_ratio = float(self.model_config["mask_ratio"])
+        self.seed = int(self.model_config.get("seed", 42) if seed is None else seed)
+
+    def make_mask(
+        self, batch_size: int, device: torch.device, *, step: int | None = None
+    ) -> torch.Tensor:
+        """Create the mask for a global step, preserving resume determinism."""
+        generator = torch.Generator().manual_seed(
+            self.seed + (self.global_step if step is None else step)
+        )
+        return tube_mask(
+            batch_size,
+            _sequence_length(self.model.config),
+            self.mask_ratio,
+            generator,
+        ).to(device)
+
+    def training_step(self, batch: Mapping[str, Any], batch_idx: int) -> torch.Tensor:
+        pixel_values = batch["pixel_values"]
+        mask = self.make_mask(pixel_values.shape[0], pixel_values.device)
+        loss = self.model(pixel_values=pixel_values, bool_masked_pos=mask).loss
+        if loss is None or not torch.isfinite(loss):
+            raise FloatingPointError(f"non-finite training loss at batch {batch_idx}")
+        self.log("pretrain/loss", loss, on_step=True, on_epoch=True, sync_dist=False)
+        return loss
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+
+def _sequence_length(config: Any) -> int:
+    image_height, image_width = _pair(config.image_size)
+    patch_height, patch_width = _pair(config.patch_size)
+    return (
+        (config.num_frames // config.tubelet_size)
+        * (image_height // patch_height)
+        * (image_width // patch_width)
+    )
+
+
+def _pair(value: int | tuple[int, int] | list[int]) -> tuple[int, int]:
+    return (value, value) if isinstance(value, int) else (value[0], value[1])
