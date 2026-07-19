@@ -12,7 +12,7 @@ import torch
 import yaml
 from scipy.io import savemat
 
-from marineworld.data.adapters import DatasetAdapter, build_adapter
+from marineworld.data.adapters import CompositeAdapter, DatasetAdapter, build_adapter
 from marineworld.data.clips import (
     DecordVideoDecoder,
     MaritimeClipDataset,
@@ -22,7 +22,7 @@ from marineworld.data.clips import (
 )
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 from marineworld.data.fvessel import FVesselAdapter
-from marineworld.data.manifest import manifest_checksum, validate_manifest
+from marineworld.data.manifest import manifest_checksum, validate_frame_targets, validate_manifest
 from marineworld.data.smd import SMDAdapter
 from marineworld.data.synthetic import SyntheticAdapter
 
@@ -138,6 +138,121 @@ def test_manifest_checksum_is_order_independent(tmp_path: Path):
     )
 
 
+def test_manifest_checksum_is_portable_and_content_sensitive(tmp_path: Path) -> None:
+    roots = [tmp_path / "first", tmp_path / "second"]
+    manifests = []
+    for root in roots:
+        video = root / "nested" / "clip.mp4"
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"same-video-content")
+        manifests.append(_manifest(_record(video, record_id="nested/clip", split="train")))
+
+    assert manifest_checksum(manifests[0]) == manifest_checksum(manifests[1])
+
+    roots[1].joinpath("nested/clip.mp4").write_bytes(b"changed-video-content")
+    assert manifest_checksum(manifests[0]) != manifest_checksum(manifests[1])
+
+
+def test_manifest_checksum_detects_same_size_large_media_mutation(tmp_path: Path) -> None:
+    payload = bytearray(b"a" * 1024 * 1024)
+    videos = [tmp_path / name / "clip.mp4" for name in ("first", "second")]
+    for video in videos:
+        video.parent.mkdir()
+        video.write_bytes(payload)
+    manifests = [_manifest(_record(video, record_id="clip", split="train")) for video in videos]
+    assert manifest_checksum(manifests[0]) == manifest_checksum(manifests[1])
+
+    payload[len(payload) // 4] = ord("b")
+    videos[1].write_bytes(payload)
+    assert manifest_checksum(manifests[0]) != manifest_checksum(manifests[1])
+
+
+def test_manifest_carries_access_and_label_provenance(tmp_path: Path) -> None:
+    manifest = DatasetManifest(
+        "demo",
+        "1",
+        "MIT",
+        (_record(tmp_path / "clip.mp4", record_id="clip", split="train"),),
+        access="public",
+        label_mapping={"1": "vessel"},
+        native_labels=("native:1",),
+    )
+
+    assert manifest.access == "public"
+    assert manifest.label_mapping == {"1": "vessel"}
+    assert manifest.native_labels == ("native:1",)
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        (_target(-1), "frame index"),
+        (
+            FrameTargets(0, np.asarray([[1, 2, 1, 4]], dtype=np.float32), np.asarray([1])),
+            "positive area",
+        ),
+        (
+            FrameTargets(0, np.asarray([[1, 2, 20, 4]], dtype=np.float32), np.asarray([1])),
+            "bounds",
+        ),
+        (
+            FrameTargets(
+                0,
+                np.asarray([[1, 2, 3, 4]], dtype=np.float32),
+                np.asarray([float("nan")]),
+            ),
+            "class IDs",
+        ),
+    ],
+)
+def test_frame_target_validator_rejects_malformed_geometry(
+    tmp_path: Path, target: FrameTargets, message: str
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    record = _record(video, record_id="clip", split="train")
+
+    with pytest.raises(ValueError, match=message):
+        validate_frame_targets(record, (target,), source_size=(10, 10))
+
+
+def test_clip_dataset_validates_targets_outside_current_clip(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    record = replace(_record(video, record_id="clip", split="train"), num_frames=4)
+    dataset = MaritimeClipDataset(
+        _manifest(record),
+        SyntheticVideoDecoder(10, 10),
+        split="train",
+        frames=2,
+        stride=1,
+        image_size=10,
+        seed=42,
+        target_loader=lambda _: (
+            FrameTargets(99, np.empty((0, 4), np.float32), np.empty(0, np.int64)),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="frame index"):
+        dataset[0]
+
+
+def test_composite_adapter_preserves_dataset_identity_and_provenance(tmp_path: Path) -> None:
+    first = SyntheticAdapter(version="one", num_videos=1, num_frames=4)
+    second = SyntheticAdapter(version="two", num_videos=1, num_frames=4)
+    adapter = CompositeAdapter(
+        components={"smd": first, "fvessel": second},
+        roots={"smd": tmp_path / "smd", "fvessel": tmp_path / "fvessel"},
+    )
+
+    manifest = adapter.build_manifest(tmp_path)
+
+    assert {record.dataset for record in manifest.records} == {"smd", "fvessel"}
+    assert set(manifest.component_checksums) == {"smd", "fvessel"}
+    assert manifest.components["smd"]["version"] == "one"
+    assert {record.id.split(":", 1)[0] for record in manifest.records} == {"smd", "fvessel"}
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     [
@@ -203,6 +318,36 @@ def test_fvessel_parses_mot_targets(tmp_path: Path) -> None:
 
     assert targets[0].boxes_xyxy.tolist() == [[10.0, 20.0, 40.0, 60.0]]
     assert targets[0].track_ids.tolist() == [7]
+
+
+def test_fvessel_rejects_truncated_mot_rows(tmp_path: Path) -> None:
+    adapter, root = _fvessel_adapter(tmp_path)
+    record = adapter.build_manifest(root).records[0]
+    assert record.annotation_path is not None
+    record.annotation_path.write_text("1,7,10\n")
+
+    with pytest.raises(ValueError, match="MOT row 1"):
+        adapter.load_targets(record)
+
+
+@pytest.mark.parametrize("value", ["1.5", "nan", "-1"])
+def test_fvessel_rejects_invalid_integer_identifiers(tmp_path: Path, value: str) -> None:
+    adapter, root = _fvessel_adapter(tmp_path)
+    record = adapter.build_manifest(root).records[0]
+    assert record.annotation_path is not None
+    record.annotation_path.write_text(f"1,{value},10,20,30,40,1,1\n")
+
+    with pytest.raises(ValueError, match="finite non-negative integer"):
+        adapter.load_targets(record)
+
+
+def test_fvessel_rejects_zero_native_frame_id(tmp_path: Path) -> None:
+    adapter, root = _fvessel_adapter(tmp_path)
+    record = adapter.build_manifest(root).records[0]
+    assert record.annotation_path is not None
+    record.annotation_path.write_text("0,1,10,20,30,40,1,1\n")
+    with pytest.raises(ValueError, match="positive integer"):
+        adapter.load_targets(record)
 
 
 def test_smd_pairs_native_objectgt_and_parses_vessel_targets(tmp_path: Path) -> None:

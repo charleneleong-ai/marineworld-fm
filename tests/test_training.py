@@ -18,9 +18,12 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader
 
+from marineworld.data.adapters import CompositeAdapter
 from marineworld.data.clips import SyntheticVideoDecoder
 from marineworld.data.contracts import DatasetManifest
 from marineworld.data.fvessel import FVesselAdapter
+from marineworld.data.manifest import manifest_checksum
+from marineworld.data.synthetic import SyntheticAdapter
 from marineworld.models.videomae import build_videomae, encode_video, tube_mask
 from marineworld.train.experiment import (
     RunIdentity,
@@ -30,7 +33,15 @@ from marineworld.train.experiment import (
     resolved_config,
 )
 from marineworld.train.module import VideoMAEPretrainingModule
-from marineworld.train.pretrain import _prepare_manifest, build_dataloaders, run_pretraining
+from marineworld.train.pretrain import (
+    BalancedDatasetSampler,
+    _BalancedSamplerCheckpoint,
+    _prepare_manifest,
+    _training_run_identity,
+    build_dataloaders,
+    run_pretraining,
+    write_training_manifest,
+)
 
 
 def test_project_tooling_targets_python_311() -> None:
@@ -314,11 +325,62 @@ def test_annotated_fvessel_batches_omit_non_collatable_targets(
         lambda *_: pytest.fail("SSL must not parse supervised annotations"),
     )
 
-    dataloaders = build_dataloaders(cfg, manifest, adapter)
+    dataloaders = build_dataloaders(cfg, manifest)
     batch = next(iter(dataloaders["train_dataloaders"]))
 
-    assert batch.keys() == {"pixel_values"}
+    assert batch.keys() == {"pixel_values", "dataset", "record_id", "source"}
     assert batch["pixel_values"].shape == (1, 4, 3, 16, 16)
+
+
+def test_balanced_sampler_equalizes_datasets_and_replays_from_epoch() -> None:
+    dataset_ids = ("smd",) * 90 + ("fvessel",) * 10
+    first = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
+    first.set_epoch(3)
+    indices = list(first)
+    first.position = 10
+    state = first.state_dict()
+    resumed = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
+    resumed.load_state_dict(state)
+
+    assert [dataset_ids[index] for index in indices].count("smd") == 50
+    assert [dataset_ids[index] for index in indices].count("fvessel") == 50
+    assert list(resumed) == indices[10:]
+
+
+def test_dataloader_uses_distributed_rank_from_lightning_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _smoke_config(tmp_path, max_steps=2)
+    adapter = SyntheticAdapter(num_frames=4, num_videos=2)
+    manifest = adapter.build_manifest(tmp_path / "data")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    sampler = build_dataloaders(cfg, manifest)["train_dataloaders"].sampler
+
+    assert isinstance(sampler, BalancedDatasetSampler)
+    assert (sampler.rank, sampler.replicas) == (1, 2)
+
+
+def test_balanced_sampler_partitions_one_global_order_across_ranks() -> None:
+    dataset_ids = ("smd",) * 8 + ("fvessel",) * 4
+    global_order = list(BalancedDatasetSampler(dataset_ids, seed=42))
+    rank_zero = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=0, replicas=2))
+    rank_one = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=1, replicas=2))
+
+    assert rank_zero == global_order[0::2]
+    assert rank_one == global_order[1::2]
+
+
+def test_balanced_sampler_pads_odd_global_order_equally_across_ranks() -> None:
+    dataset_ids = ("smd",) * 7 + ("fvessel",) * 4
+    rank_zero = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=0, replicas=2))
+    rank_one = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=1, replicas=2))
+
+    assert len(rank_zero) == len(rank_one) == 6
+    combined = rank_zero + rank_one
+    assert [dataset_ids[index] for index in combined].count("smd") == 6
+    assert [dataset_ids[index] for index in combined].count("fvessel") == 6
 
 
 def test_default_fvessel_manifest_is_split_by_video_without_overlap(tmp_path: Path) -> None:
@@ -383,6 +445,7 @@ def test_empty_data_root_cli_exits_without_checkpoint(tmp_path: Path) -> None:
     root = tmp_path / "empty"
     output_dir = tmp_path / "output"
     root.mkdir()
+    environment = os.environ | {"KMP_USE_SHM": "0", "TMPDIR": "/tmp"}
 
     result = subprocess.run(
         [
@@ -398,6 +461,7 @@ def test_empty_data_root_cli_exits_without_checkpoint(tmp_path: Path) -> None:
         ],
         capture_output=True,
         cwd=tmp_path,
+        env=environment,
         text=True,
         timeout=20,
     )
@@ -537,6 +601,8 @@ def test_offline_smoke_creates_local_wandb_run_without_network(
     output_dir = tmp_path / "output"
     data_root = tmp_path / "data"
     environment = os.environ | {
+        "KMP_USE_SHM": "0",
+        "TMPDIR": "/tmp",
         "WANDB_BASE_URL": "http://127.0.0.1:9",
         "WANDB_DIR": str(wandb_dir),
         "WANDB_MODE": "offline",
@@ -589,6 +655,201 @@ def test_mask_for_step_is_reproducible_after_resume() -> None:
 
     assert torch.equal(step_three, resumed_step_three)
     assert torch.equal(first.make_mask(1, torch.device("cpu"), step=4), expected_step_four)
+
+
+def test_masks_are_unique_per_accumulated_microbatch() -> None:
+    module = VideoMAEPretrainingModule(_tiny_model_config(), seed=42)
+
+    first = module.make_mask(1, torch.device("cpu"), step=3, microbatch=0)
+    second = module.make_mask(1, torch.device("cpu"), step=3, microbatch=1)
+
+    assert not torch.equal(first, second)
+
+
+def test_optimizer_uses_warmup_cosine_scheduler() -> None:
+    module = VideoMAEPretrainingModule(_tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4)
+    configured = module.configure_optimizers()
+
+    assert configured["lr_scheduler"]["interval"] == "step"
+    scheduler = configured["lr_scheduler"]["scheduler"]
+    initial = scheduler.get_last_lr()[0]
+    values = []
+    for _ in range(8):
+        scheduler.optimizer.step()
+        scheduler.step()
+        values.append(scheduler.get_last_lr()[0])
+    assert initial < values[0]
+    assert values[-1] < values[2]
+
+    resumed_module = VideoMAEPretrainingModule(
+        _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4
+    )
+    resumed = resumed_module.configure_optimizers()["lr_scheduler"]["scheduler"]
+    resumed.load_state_dict(scheduler.state_dict())
+    assert resumed.get_last_lr() == scheduler.get_last_lr()
+
+
+def test_scheduler_uses_trainer_optimizer_step_estimate() -> None:
+    module = VideoMAEPretrainingModule(_tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4)
+    module._trainer = SimpleNamespace(estimated_stepping_batches=4)
+    scheduler = module.configure_optimizers()["lr_scheduler"]["scheduler"]
+
+    for _ in range(4):
+        scheduler.optimizer.step()
+        scheduler.step()
+
+    assert scheduler.get_last_lr() == [0.0]
+
+
+def test_training_manifest_records_exact_splits_without_raw_paths(tmp_path: Path) -> None:
+    _, manifest = _fvessel_manifest(tmp_path / "restricted", videos=2)
+
+    path = write_training_manifest(manifest, tmp_path / "artifacts")
+    payload = json.loads(path.read_text())
+
+    assert payload["manifest_checksum"] == manifest_checksum(manifest)
+    assert {record["id"] for record in payload["records"]} == {
+        record.id for record in manifest.records
+    }
+    assert "video_path" not in path.read_text()
+    assert str(tmp_path / "restricted") not in path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("update", "value"),
+    [
+        ("data.sampling_weights.smd", 0.9),
+        ("data.transforms.train.color_jitter", 0.2),
+        ("train.warmup_epochs", 20),
+    ],
+)
+def test_training_identity_hashes_material_scientific_config(
+    tmp_path: Path, update: str, value: object
+) -> None:
+    cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
+    first = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
+    baseline = _training_run_identity(cfg, first)
+    OmegaConf.update(cfg, update, value)
+
+    assert _training_run_identity(cfg, first).run_id != baseline.run_id
+
+
+def test_training_identity_ignores_execution_hardware(tmp_path: Path) -> None:
+    manifest = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
+    l4 = _compose_config("data=joint_synthetic", "model=videomae_tiny", "runtime=l4")
+    a100 = _compose_config("data=joint_synthetic", "model=videomae_tiny", "runtime=a100")
+    a100.runtime.batch_size = l4.runtime.batch_size
+    a100.runtime.accumulate_grad_batches = l4.runtime.accumulate_grad_batches
+
+    assert (
+        _training_run_identity(l4, manifest).run_id == _training_run_identity(a100, manifest).run_id
+    )
+
+
+def test_training_identity_is_stable_across_resume_horizon(tmp_path: Path) -> None:
+    manifest = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
+    first = _smoke_config(tmp_path, max_steps=2)
+    resumed = OmegaConf.merge(
+        first,
+        {
+            "runtime": {
+                "max_steps": 3,
+                "limit_train_batches": 1,
+                "limit_val_batches": 1,
+                "ckpt_path": str(tmp_path / "last.ckpt"),
+            }
+        },
+    )
+
+    assert (
+        _training_run_identity(first, manifest).run_id
+        == _training_run_identity(resumed, manifest, "sha256:resume").run_id
+    )
+
+
+def test_sampler_callback_advances_relative_to_restored_position() -> None:
+    sampler = BalancedDatasetSampler(("smd",) * 4 + ("fvessel",) * 4, seed=42)
+    callback = _BalancedSamplerCheckpoint(sampler, batch_size=2)
+    callback.load_state_dict({"epoch": 0, "position": 4})
+
+    callback.on_train_batch_end(None, None, None, None, batch_idx=0)  # type: ignore[arg-type]
+    assert sampler.position == 6
+    callback.on_train_batch_end(None, None, None, None, batch_idx=1)  # type: ignore[arg-type]
+
+    assert sampler.position == 8
+
+
+def test_build_dataloaders_accepts_legacy_adapter_position(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter = SyntheticAdapter(num_frames=4, num_videos=2)
+    manifest = adapter.build_manifest(tmp_path / "data")
+    cfg = _smoke_config(tmp_path, max_steps=1)
+
+    loaders = build_dataloaders(cfg, manifest, adapter)
+
+    assert loaders["train_dataloaders"]
+
+
+def test_joint_split_preserves_each_component_in_training(tmp_path: Path) -> None:
+    composite = CompositeAdapter(
+        components={
+            "smd": SyntheticAdapter(num_frames=4, num_videos=2),
+            "fvessel": SyntheticAdapter(num_frames=4, num_videos=2),
+        },
+        roots={"smd": tmp_path / "smd", "fvessel": tmp_path / "fvessel"},
+    )
+    manifest = composite.build_manifest(tmp_path)
+    manifest = replace(
+        manifest,
+        records=tuple(replace(record, split="train") for record in manifest.records),
+    )
+    cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
+    cfg.seed = 5
+
+    prepared = _prepare_manifest(cfg, manifest)
+
+    assert {record.dataset for record in prepared.records if record.split == "train"} == {
+        "smd",
+        "fvessel",
+    }
+
+
+def test_draw_tokens_vary_by_epoch_and_replay_after_resume(tmp_path: Path) -> None:
+    cfg = _smoke_config(tmp_path, max_steps=2)
+    adapter = SyntheticAdapter(num_frames=4, num_videos=4)
+    manifest = adapter.build_manifest(tmp_path / "data")
+    loader = build_dataloaders(cfg, manifest)["train_dataloaders"]
+    sampler = loader.sampler
+    assert isinstance(sampler, BalancedDatasetSampler)
+    dataset = loader.dataset
+
+    first_draw = list(sampler)[0]
+    sampler.set_epoch(1)
+    second_draw = list(sampler)[0]
+    assert not torch.equal(
+        dataset[first_draw]["pixel_values"], dataset[second_draw]["pixel_values"]
+    )
+
+    sampler.set_epoch(3)
+    sampler.position = 1
+    state = sampler.state_dict()
+    remaining = list(sampler)
+    replay = BalancedDatasetSampler(
+        tuple("synthetic" for _ in range(len(dataset))),
+        seed=int(cfg.seed),
+        draw_tokens=True,
+    )
+    replay.load_state_dict(state)
+    replayed = list(replay)
+    assert replayed == remaining
+    assert all(
+        torch.equal(dataset[left]["pixel_values"], dataset[right]["pixel_values"])
+        for left, right in zip(remaining, replayed, strict=True)
+    )
+
+    val_dataset = build_dataloaders(cfg, manifest)["val_dataloaders"].dataset
+    assert torch.equal(val_dataset[0]["pixel_values"], val_dataset[0]["pixel_values"])
 
 
 def test_encode_video_preserves_batch_token_and_hidden_layout(

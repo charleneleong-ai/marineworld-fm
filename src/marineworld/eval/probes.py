@@ -50,6 +50,7 @@ class ProbeResult:
     metric: str
     value: float | None
     status: ProbeStatus
+    evaluation_split: str = "val"
     model: str | None = None
     device: str | None = None
     label_subset_checksum: str | None = None
@@ -225,6 +226,61 @@ def aggregate_probe_results(results: Sequence[ProbeResult]) -> pd.DataFrame:
             dtype=object,
         )
     return table
+
+
+def nearest_neighbour_diagnostic(
+    queries: torch.Tensor,
+    references: torch.Tensor,
+    *,
+    query_ids: Sequence[str],
+    reference_ids: Sequence[str],
+    max_references: int = 1_024,
+    neighbours: int = 1,
+    seed: int = 42,
+) -> tuple[dict[str, str | int], ...]:
+    """Return bounded cosine neighbours without materializing a corpus-scale index."""
+    if queries.ndim != 2 or references.ndim != 2 or queries.shape[1] != references.shape[1]:
+        raise ValueError("query and reference features must be [N, D] with matching D")
+    if len(query_ids) != len(queries) or len(reference_ids) != len(references):
+        raise ValueError("feature and identifier lengths must align")
+    if not len(references):
+        raise ValueError("nearest-neighbour diagnostic requires a nonempty reference corpus")
+    if max_references <= 0 or neighbours <= 0:
+        raise ValueError("diagnostic bounds must be positive")
+    bounded = min(max_references, len(references))
+    selected = torch.randperm(len(references), generator=torch.Generator().manual_seed(seed))[
+        :bounded
+    ]
+    normalized_queries = torch.nn.functional.normalize(queries.detach().cpu(), dim=1)
+    normalized_references = torch.nn.functional.normalize(
+        references[selected].detach().cpu(), dim=1
+    )
+    ranks = (
+        (normalized_queries @ normalized_references.T).topk(min(neighbours, bounded), dim=1).indices
+    )
+    return tuple(
+        {
+            "query_id": query_id,
+            "neighbour_id": reference_ids[int(selected[int(reference_index)])],
+            "rank": rank + 1,
+        }
+        for query_id, row in zip(query_ids, ranks, strict=True)
+        for rank, reference_index in enumerate(row)
+    )
+
+
+def masked_reconstruction_diagnostic(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, float | int]:
+    """Summarize reconstruction error over masked tokens only."""
+    if prediction.shape != target.shape or mask.shape != prediction.shape:
+        raise ValueError("prediction, target, and mask shapes must match")
+    if mask.dtype != torch.bool or not mask.any():
+        raise ValueError("mask must select at least one token")
+    error = (prediction.detach() - target.detach()).square()[mask]
+    return {"masked_mse": float(error.mean()), "masked_tokens": int(error.numel())}
 
 
 def _freeze_encoder(encoder: ParameterizedEncoder) -> None:

@@ -96,6 +96,29 @@ MARINEWORLD_DATA_ROOT=/path/to/fvessel mise run train:l4
 MARINEWORLD_DATA_ROOT=/path/to/fvessel mise run train:a100
 ```
 
+The primary scientific run jointly samples SMD and FVessel with explicit 50/50
+dataset probability mass. Override the component roots rather than copying or
+symlinking restricted media:
+
+```bash
+uv run --extra train python -m marineworld.train.pretrain data=joint runtime=l4 \
+  data.components.smd.root=/data/smd data.components.fvessel.root=/data/fvessel
+uv run --extra train python -m marineworld.train.pretrain data=joint runtime=a100 \
+  data.components.smd.root=/data/smd data.components.fvessel.root=/data/fvessel
+```
+
+`data.sampling_weights` is configurable, but defaults to `{smd: 0.5,
+fvessel: 0.5}` independently of corpus size. The sampler is seeded, epoch-aware,
+rank-sharded, and checkpoint/restart reproducible. Batches retain dataset, source,
+and record identities. Training uses ImageNet normalization expected by the
+VideoMAE input contract plus deterministic train-only brightness jitter; validation
+and test transforms are deterministic and no spatial augmentation can silently
+misalign boxes. Single-dataset `data=smd` and `data=fvessel` runs remain supported.
+
+Each training run writes a path-free `training_manifest.json` and logs it as a W&B
+dataset artifact. It records exact split membership, component checksums, licence
+and access metadata without uploading raw frames or restricted mount paths.
+
 The L4 and A100 profiles share the data, model, optimization schedule, and trainer behavior.
 They differ only in precision, batch size, gradient accumulation, and data-loader workers.
 
@@ -160,8 +183,9 @@ resampling, rescale, and normalization semantics. Hub revisions are pinned in th
 model configs and included in result/run provenance. FVessel and SMD adapters probe
 each source video's real frame count; a probe is unavailable when either supervised
 split has no labelled video long enough for the configured encoder.
-SMD supervision uses the explicit `smd_objectgt_mat` adapter format: each annotated
-video is paired with `ObjectGT/<video_stem>_ObjectGT.mat`, whose native `structXML` entries
+SMD supervision uses the explicit `smd_objectgt_mat` adapter format. The authoritative
+benchmark annotates only 63 of 81 videos, so unannotated videos remain valid SSL inputs;
+every ObjectGT file that is present must pair strictly with its video. Native `structXML` entries
 provide zero-based frame boxes and class labels. The parser retains vessel classes
 1 and 3--7, preserves annotated empty frames, ignores invalid class 0, buoy class 2,
 and non-vessel/other classes 8--10, and rejects unsupported or malformed schemas

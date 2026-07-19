@@ -73,7 +73,15 @@ class SMDAdapter:
             )
             for video in videos
         )
-        return DatasetManifest("smd", self.version, "restricted", records)
+        return DatasetManifest(
+            "smd",
+            self.version,
+            "research-only; see dataset terms",
+            records,
+            access="restricted",
+            label_mapping={str(key): value for key, value in SMD_VESSEL_CLASSES.items()},
+            native_labels=tuple(f"{key}:{value}" for key, value in SMD_VESSEL_CLASSES.items()),
+        )
 
     def load_targets(self, record: VideoRecord) -> tuple[FrameTargets, ...]:
         self._validate_annotation_format()

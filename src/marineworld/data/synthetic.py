@@ -26,7 +26,7 @@ class SyntheticAdapter:
             self._record(root, _SPLITS[index % len(_SPLITS)], index // len(_SPLITS))
             for index in range(self.num_videos)
         )
-        return DatasetManifest("synthetic", self.version, "MIT", records)
+        return DatasetManifest("synthetic", self.version, "MIT", records, access="public")
 
     def load_targets(self, record: VideoRecord) -> tuple[FrameTargets, ...]:
         return ()

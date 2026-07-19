@@ -13,7 +13,11 @@ import torch.nn.functional as functional
 from torch.utils.data import Dataset
 
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
-from marineworld.data.manifest import manifest_checksum, validate_manifest
+from marineworld.data.manifest import (
+    manifest_checksum,
+    validate_frame_targets,
+    validate_manifest,
+)
 
 Split = Literal["train", "val", "test"]
 TargetLoader = Callable[[VideoRecord], tuple[FrameTargets, ...]]
@@ -32,6 +36,14 @@ class ClipIndex:
     record_id: str
     start: int
     frame_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SampleDraw:
+    """One clip draw with a stateless, replayable augmentation seed."""
+
+    index: int
+    augmentation_seed: int
 
 
 @dataclass(frozen=True)
@@ -147,6 +159,9 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         image_size: int | None,
         seed: int,
         target_loader: TargetLoader | None = None,
+        normalization_mean: tuple[float, float, float] | None = None,
+        normalization_std: tuple[float, float, float] | None = None,
+        color_jitter: float = 0.0,
     ) -> None:
         if image_size is not None and image_size <= 0:
             raise ValueError("image_size must be positive")
@@ -157,12 +172,23 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         self.decoder = decoder
         self.image_size = image_size
         self.target_loader = target_loader or _empty_targets
+        if (normalization_mean is None) != (normalization_std is None):
+            raise ValueError("normalization mean and std must be configured together")
+        if color_jitter < 0:
+            raise ValueError("color jitter must be non-negative")
+        self.normalization_mean = normalization_mean
+        self.normalization_std = normalization_std
+        self.color_jitter = color_jitter if split == "train" else 0.0
+        self.seed = seed
         self._targets_by_record: dict[str, tuple[FrameTargets, ...]] = {}
+        self._validated_target_records: set[str] = set()
 
     def __len__(self) -> int:
         return len(self.clips)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int | SampleDraw) -> dict[str, Any]:
+        augmentation_seed = index.augmentation_seed if isinstance(index, SampleDraw) else None
+        index = index.index if isinstance(index, SampleDraw) else index
         clip = self.clips[index]
         record = self.records[clip.record_id]
         frames = self.decoder.decode(record, clip.frame_indices)
@@ -174,12 +200,16 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
                 f"got {actual_frames}"
             )
         transform = self.spatial_transform(frames)
+        targets = self.targets_for(record, clip.frame_indices, source_size=frames.shape[-2:])
         return {
-            "pixel_values": self.transform(frames),
+            "pixel_values": self.transform(
+                frames, sample_index=index, augmentation_seed=augmentation_seed
+            ),
             "frame_indices": torch.tensor(clip.frame_indices, dtype=torch.long),
             "record_id": record.id,
             "dataset": record.dataset,
-            "targets": self.targets_for(record, clip.frame_indices),
+            "source": record.source,
+            "targets": targets,
             "is_labelled": record.dataset == "synthetic" or record.annotation_path is not None,
             "spatial_transform": transform,
         }
@@ -202,7 +232,11 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         )
 
     def targets_for(
-        self, record: VideoRecord, frame_indices: Sequence[int]
+        self,
+        record: VideoRecord,
+        frame_indices: Sequence[int],
+        *,
+        source_size: tuple[int, int] | None = None,
     ) -> tuple[FrameTargets, ...]:
         selected_indices = set(frame_indices)
         targets = self._targets_by_record.get(record.id)
@@ -211,9 +245,18 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
                 sorted(self.target_loader(record), key=lambda target: target.frame_index)
             )
             self._targets_by_record[record.id] = targets
+        if source_size is not None and record.id not in self._validated_target_records:
+            validate_frame_targets(record, targets, source_size=source_size)
+            self._validated_target_records.add(record.id)
         return tuple(target for target in targets if target.frame_index in selected_indices)
 
-    def transform(self, frames: torch.Tensor) -> torch.Tensor:
+    def transform(
+        self,
+        frames: torch.Tensor,
+        *,
+        sample_index: int = 0,
+        augmentation_seed: int | None = None,
+    ) -> torch.Tensor:
         """Resize decoded RGB frames and normalize byte tensors to floats."""
         if frames.ndim != 4 or frames.shape[1] != 3:
             raise ValueError("decoder must return frames shaped [T, 3, H, W]")
@@ -221,14 +264,24 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         pixel_values = frames.to(dtype=torch.float32)
         if not torch.is_floating_point(frames):
             pixel_values = pixel_values / 255.0
-        if self.image_size is None:
-            return pixel_values
-        return functional.interpolate(
-            pixel_values,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        if self.image_size is not None:
+            pixel_values = functional.interpolate(
+                pixel_values,
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        if self.color_jitter:
+            generator = torch.Generator().manual_seed(
+                self.seed + sample_index if augmentation_seed is None else augmentation_seed
+            )
+            brightness = 1 + self.color_jitter * (2 * torch.rand((), generator=generator) - 1)
+            pixel_values = (pixel_values * brightness).clamp(0, 1)
+        if self.normalization_mean is not None and self.normalization_std is not None:
+            mean = pixel_values.new_tensor(self.normalization_mean).view(1, 3, 1, 1)
+            std = pixel_values.new_tensor(self.normalization_std).view(1, 3, 1, 1)
+            pixel_values = (pixel_values - mean) / std
+        return pixel_values
 
 
 def _empty_targets(_: VideoRecord) -> tuple[FrameTargets, ...]:

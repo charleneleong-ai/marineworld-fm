@@ -18,3 +18,9 @@ ais:
 split:
   val_frac: 0.15
   test_frac: 0.15
+transforms:
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  train:
+    color_jitter: 0.1

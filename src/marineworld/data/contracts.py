@@ -38,6 +38,12 @@ class DatasetManifest:
     version: str
     license: str
     records: tuple[VideoRecord, ...]
+    access: Literal["public", "restricted", "unknown"] = "unknown"
+    label_mapping: Mapping[str, str] = field(default_factory=dict)
+    native_labels: tuple[str, ...] = ()
+    component_checksums: Mapping[str, str] = field(default_factory=dict)
+    components: Mapping[str, JSONValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "records", tuple(self.records))
+        object.__setattr__(self, "native_labels", tuple(self.native_labels))
