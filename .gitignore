@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.mise.local.toml
+
+# Data + artifacts (keep out of VCS; committed splits live under configs/splits)
+data/raw/
+data/processed/
+checkpoints/
+outputs/
+wandb/
+*.mp4
+*.ckpt
+*.pt
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+.env
+.env.local

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marineworld-fm"
+version = "0.0.1"
+description = "Self-supervised multimodal temporal foundation model for maritime perception"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Deps are grouped: core (always needed for data/alignment utils) and
+# train (heavier ML stack). Keep core light so the alignment utility and
+# tests run without a full torch install if desired.
+dependencies = [
+    "numpy>=1.26,<2.2",
+    "pandas>=2.1,<2.3",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.2,<2.6",
+    "torchvision>=0.17",
+    "pytorch-lightning>=2.2,<2.5",
+    "transformers>=4.44",          # VideoMAE backbone
+    "timm>=1.0",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "decord>=0.6",                 # fast video frame decoding
+    "wandb>=0.17",
+    "motmetrics>=1.4",             # tracking eval (MOTA/IDF1)
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,16 @@
+# FVessel dataset config (video + AIS).
+name: fvessel
+root: data/raw/fvessel
+num_frames: 16
+image_size: 224
+fps: null              # parsed per-clip in v1; null means "use source fps"
+
+# AIS<->frame temporal alignment (see marineworld.data.alignment).
+ais:
+  method: linear       # "linear" or "nearest"
+  tolerance_ms: 500    # max |frame_t - sample_t| for nearest / endpoint clamp
+  max_gap_ms: null     # null => 4 * tolerance_ms; larger gaps are dropouts
+
+split:
+  val_frac: 0.15
+  test_frac: 0.15

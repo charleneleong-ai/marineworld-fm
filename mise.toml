@@ -1,0 +1,36 @@
+[env]
+# Development environment variables for marineworld-fm.
+# Source with: `mise trust && mise run <task>` or `source <(mise activate)`
+PYTHONUNBUFFERED = "1"
+PYTHONDONTWRITEBYTECODE = "1"
+
+[tools]
+python = "3.11.9"
+
+[tasks]
+# Install development dependencies (core + train + dev).
+"setup" = "pip install -e '.[train,dev]'"
+
+# Run all tests.
+"test" = "pytest -v tests/"
+
+# Run linting and formatting checks.
+"lint" = "ruff check src/ tests/ --select E,W,F,I"
+"format" = "ruff format src/ tests/"
+"format:check" = "ruff format --check src/ tests/"
+
+# Quick check: seed util import + alignment tests only.
+"check:alignment" = "pytest -v tests/test_alignment.py"
+
+# Run tests with verbose output and stop on first failure.
+"test:fail-fast" = "pytest -v -x tests/"
+
+# Download FVessel + SMD (placeholder; requires manual download from HF/sources).
+"download:datasets" = """
+echo 'FVessel: https://huggingface.co/datasets/gy65896/FVessel'
+echo 'SMD: https://sites.google.com/site/dilipprasad/home/singapore-maritime-dataset'
+echo 'Extract into ./data/raw/{fvessel,smd}/'
+"""
+
+# Show available tasks.
+"help" = "mise tasks --no-header"

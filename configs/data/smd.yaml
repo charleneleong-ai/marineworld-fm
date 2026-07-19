@@ -1,0 +1,10 @@
+# Singapore Maritime Dataset config (video-only).
+name: smd
+root: data/raw/smd
+num_frames: 16
+image_size: 224
+# Domain-shift eval subsets (reported separately per plan).
+sources: [onshore, onboard, nir]
+split:
+  val_frac: 0.15
+  test_frac: 0.15

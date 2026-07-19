@@ -1,0 +1,10 @@
+# VideoMAE ViT-small backbone for self-supervised pretraining.
+# ViT-small default sized for a single GPU / Apple-silicon (MPS) budget.
+name: videomae_vit_small
+backbone: vit_small
+patch_size: 16
+tubelet_size: 2
+num_frames: 16
+image_size: 224
+mask_ratio: 0.9          # high ratio per VideoMAE (temporal redundancy)
+decoder_depth: 4
