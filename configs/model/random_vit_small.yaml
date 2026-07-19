@@ -1,0 +1,7 @@
+# Architecture-matched random negative control for maritime VideoMAE probes.
+defaults:
+  - videomae_vit_small
+  - _self_
+
+name: random_videomae_vit_small
+condition: random

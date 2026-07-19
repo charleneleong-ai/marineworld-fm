@@ -197,6 +197,7 @@ def test_run_identity_is_stable_across_manifest_order() -> None:
         identity.run_id
         == build_run_identity("videomae", ("sha-b", "sha-a"), seed=42, label_fraction=None).run_id
     )
+    assert identity.run_id == "a82f5fb546450652"
     assert metric_name("probe", "macro_f1", "fvessel") == "probe/fvessel/macro_f1"
 
 

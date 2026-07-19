@@ -30,6 +30,7 @@ from marineworld.data.alignment import (
     load_ais_tracks,
 )
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
+from marineworld.data.video import probe_video_frame_count
 
 __all__ = ["FVesselAdapter", "FVesselSample", "load_sample"]
 
@@ -59,8 +60,9 @@ class FVesselAdapter:
 
     version: str = "v1"
     fps: float | None = None
-    num_frames: int = 16
+    num_frames: int | None = None
     fps_probe: Callable[[Path], float] = _probe_fps
+    frame_count_probe: Callable[[Path], int] = probe_video_frame_count
 
     def build_manifest(self, root: Path) -> DatasetManifest:
         records = tuple(self._record(root, video) for video in sorted(root.rglob("*.mp4")))
@@ -109,7 +111,7 @@ class FVesselAdapter:
             split="train",
             source=video.parent.name,
             fps=self._source_fps(video),
-            num_frames=self.num_frames,
+            num_frames=self._source_num_frames(video),
             annotation_path=annotation,
             metadata={"has_ais": (video.parent / "ais").is_dir()},
         )
@@ -119,6 +121,12 @@ class FVesselAdapter:
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError(f"FVessel FPS must be positive for {video}, got {fps}")
         return fps
+
+    def _source_num_frames(self, video: Path) -> int:
+        count = self.num_frames if self.num_frames is not None else self.frame_count_probe(video)
+        if count <= 0:
+            raise ValueError(f"FVessel frame count must be positive for {video}, got {count}")
+        return count
 
 
 def _mot_path(sample_root: Path) -> Path | None:

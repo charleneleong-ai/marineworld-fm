@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -41,6 +42,7 @@ def build_run_identity(
     git_sha: str | None = None,
     accelerator: str | None = None,
     checkpoint_provenance: str | None = None,
+    logical_dimensions: Mapping[str, Any] | None = None,
 ) -> RunIdentity:
     """Build a run ID independent of source revision and execution hardware."""
     condition = {
@@ -49,6 +51,8 @@ def build_run_identity(
         "model": model,
         "seed": seed,
     }
+    if logical_dimensions:
+        condition["logical_dimensions"] = dict(logical_dimensions)
     payload = json.dumps(condition, sort_keys=True, separators=(",", ":"))
     run_id = hashlib.sha256(payload.encode()).hexdigest()[:16]
     tags = [f"model:{model}", f"seed:{seed}"]

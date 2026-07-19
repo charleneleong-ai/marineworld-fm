@@ -227,8 +227,8 @@ git commit -m "feat: unify maritime dataset adapters"
 
 **Interfaces:**
 - Consumes: validated manifests and adapter targets.
-- Produces: `ClipIndex`, `VideoDecoder`, `DecordVideoDecoder`, `SyntheticVideoDecoder`, `build_clip_index(...)`, and `MaritimeClipDataset`.
-- `MaritimeClipDataset.__getitem__` returns `{"pixel_values": FloatTensor[T,C,H,W], "frame_indices": LongTensor[T], "record_id": str, "dataset": str, "targets": tuple[FrameTargets, ...]}`.
+- Produces: `ClipIndex`, `SpatialTransform`, `VideoDecoder`, `DecordVideoDecoder`, `SyntheticVideoDecoder`, `build_clip_index(...)`, and `MaritimeClipDataset`.
+- `MaritimeClipDataset.__getitem__` returns `{"pixel_values": FloatTensor[T,C,H,W], "frame_indices": LongTensor[T], "record_id": str, "dataset": str, "targets": tuple[FrameTargets, ...], "spatial_transform": SpatialTransform}`. The transform is derived from decoded source dimensions before resize and records source/output size, scale, and zero crop offsets.
 
 - [ ] **Step 1: Write failing deterministic-index and tensor-contract tests**
 
@@ -276,6 +276,16 @@ class ClipIndex:
     frame_indices: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class SpatialTransform:
+    source_size: tuple[int, int]
+    output_size: tuple[int, int]
+    scale: tuple[float, float]
+    offset: tuple[float, float] = (0.0, 0.0)
+
+    def apply_boxes_xyxy(self, boxes: np.ndarray) -> np.ndarray: ...
+
+
 class MaritimeClipDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         clip = self.clips[index]
@@ -288,10 +298,11 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
             "record_id": record.id,
             "dataset": record.dataset,
             "targets": self.targets_for(record, clip.frame_indices),
+            "spatial_transform": self.spatial_transform(frames),
         }
 ```
 
-Use decord only inside `DecordVideoDecoder`; no function-local imports are needed because it is a declared training dependency. Add `scikit-learn>=1.5` for Task 7 and `python-dotenv>=1.0` for the local environment loader.
+Use decord only inside `DecordVideoDecoder`; no function-local imports are needed because it is a declared training dependency. Verify non-square source-to-square-output box mapping. Add `scikit-learn>=1.5` for Task 7 and `python-dotenv>=1.0` for the local environment loader.
 
 - [ ] **Step 4: Verify green**
 
@@ -620,7 +631,14 @@ def sample_labelled_records(records: Sequence[VideoRecord], fraction: float, see
 
 Implement random, generic VideoMAE, maritime VideoMAE, DINOv3, and V-JEPA loaders behind the same protocol. Network checkpoint retrieval is opt-in and cached; unit tests use a fake encoder. A resource failure while loading an optional reference emits `SKIPPED_RESOURCE` with the model and device, not a numeric result.
 
-Use scikit-learn logistic regression for class/count probes. The dense probe is a single linear spatial head trained without encoder gradients. Log one W&B table with condition, checkpoint, manifest checksum, dataset, task, label fraction, seed, metric, value, and status.
+Use scikit-learn logistic regression for class/count probes. The dense probe is a single linear
+spatial head trained without encoder gradients. It maps source-pixel boxes through each clip's
+`SpatialTransform`, rasterizes binary vessel occupancy onto the encoder token grid, and evaluates
+macro F1 through the same result matrix and normal/degenerate statuses. Dense extraction, head
+updates, and confusion counts stream bounded clip minibatches rather than accumulating the full
+spatiotemporal feature corpus. Log one W&B table with
+condition, checkpoint, manifest checksum, dataset, task, label fraction, seed, metric, value, and
+status.
 
 - [ ] **Step 4: Verify green**
 

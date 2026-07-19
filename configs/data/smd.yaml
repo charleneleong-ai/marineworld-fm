@@ -1,12 +1,13 @@
 # Singapore Maritime Dataset config (video-only).
 name: smd
 root: data/raw/smd
-num_frames: 16
+num_frames: null
 image_size: 224
 adapter:
   _target_: marineworld.data.smd.SMDAdapter
   version: v1
-  num_frames: 16
+  num_frames: null       # null probes each video's real frame count
+  annotation_format: smd_objectgt_mat
 # Domain-shift eval subsets (reported separately per plan).
 sources: [onshore, onboard, nir]
 split:

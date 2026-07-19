@@ -1,0 +1,6 @@
+name: videomae_base
+condition: generic_videomae
+checkpoint: MCG-NJU/videomae-base
+revision: dc740ceda42fce44faed2ea03c6d447db72f6af9
+image_size: 224
+num_frames: 16

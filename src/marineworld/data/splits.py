@@ -9,11 +9,17 @@ repo for reproducibility.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from marineworld import SEED
+from marineworld.data.contracts import DatasetManifest
+from marineworld.data.manifest import validate_manifest
 
-__all__ = ["Split", "split_by_video"]
+__all__ = ["Split", "SplitUnavailableError", "prepare_manifest_splits", "split_by_video"]
+
+
+class SplitUnavailableError(ValueError):
+    """A manifest cannot provide disjoint training and validation videos."""
 
 
 @dataclass(frozen=True)
@@ -58,3 +64,62 @@ def split_by_video(
     val = ids[n_test : n_test + n_val]
     train = ids[n_test + n_val :]
     return Split(train=sorted(train), val=sorted(val), test=sorted(test))
+
+
+def prepare_manifest_splits(
+    manifest: DatasetManifest,
+    *,
+    val_frac: float | None,
+    test_frac: float | None,
+    seed: int,
+) -> DatasetManifest:
+    """Create deterministic whole-video splits and require train/validation data."""
+    if not manifest.records:
+        raise SplitUnavailableError("manifest contains no records")
+    validate_manifest(manifest)
+
+    if all(record.split == "train" for record in manifest.records):
+        if val_frac is None or test_frac is None:
+            raise SplitUnavailableError("manifest has no validation split or split policy")
+        if len(manifest.records) < 2:
+            raise SplitUnavailableError(
+                "at least two videos are required for train and validation splits"
+            )
+        partition = split_by_video(
+            [record.id for record in manifest.records],
+            val_frac=val_frac,
+            test_frac=test_frac,
+            seed=seed,
+        )
+        train_ids = list(partition.train)
+        val_ids = list(partition.val)
+        test_ids = list(partition.test)
+        if not val_ids:
+            source = train_ids if len(train_ids) > 1 else test_ids
+            val_ids.append(source.pop())
+        if not train_ids:
+            source = test_ids if test_ids else val_ids
+            train_ids.append(source.pop())
+        split_by_id = {
+            record_id: split
+            for split, record_ids in (
+                ("train", train_ids),
+                ("val", val_ids),
+                ("test", test_ids),
+            )
+            for record_id in record_ids
+        }
+        manifest = replace(
+            manifest,
+            records=tuple(
+                replace(record, split=split_by_id[record.id]) for record in manifest.records
+            ),
+        )
+        validate_manifest(manifest)
+
+    splits = {record.split for record in manifest.records}
+    if "train" not in splits:
+        raise SplitUnavailableError("manifest contains no training records")
+    if "val" not in splits:
+        raise SplitUnavailableError("manifest contains no validation records")
+    return manifest

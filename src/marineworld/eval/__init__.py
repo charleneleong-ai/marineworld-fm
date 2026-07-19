@@ -1,6 +1,20 @@
-"""Evaluation.
+"""Frozen representation evaluation interfaces."""
 
-v1 adds: linear-probe / frozen-feature detection, few-shot fine-tune sweeps
-(1/5/10% label budgets), and tracking metrics via `motmetrics` (MOTA/IDF1),
-reported against from-scratch and ImageNet-pretrained baselines.
-"""
+from marineworld.eval.encoders import EncoderFeatures, FrozenVideoEncoder
+from marineworld.eval.probes import (
+    ProbeResult,
+    evaluate_dense_probe,
+    evaluate_probe,
+    fit_dense_probe,
+    fit_linear_probe,
+)
+
+__all__ = [
+    "EncoderFeatures",
+    "FrozenVideoEncoder",
+    "ProbeResult",
+    "evaluate_dense_probe",
+    "evaluate_probe",
+    "fit_dense_probe",
+    "fit_linear_probe",
+]
