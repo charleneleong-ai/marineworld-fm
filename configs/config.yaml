@@ -4,12 +4,9 @@ defaults:
   - data: fvessel
   - model: videomae_vit_small
   - train: pretrain
+  - runtime: local_smoke
+  - tracking: wandb
   - _self_
 
 seed: 42
 output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
-
-# Weights & Biases (set mode=disabled to run offline).
-wandb:
-  project: marineworld-fm
-  mode: online
