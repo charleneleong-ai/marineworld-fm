@@ -41,8 +41,8 @@ def _probe_fps(video: Path) -> float:
         from decord import VideoReader
     except ImportError as error:
         raise RuntimeError(
-            "FVessel FPS probing requires optional dependency 'decord'; "
-            "install the train extra or configure a positive fps"
+            "FVessel FPS probing requires optional dependency 'decord'; run on a supported "
+            "platform or configure a positive fps"
         ) from error
 
     try:
