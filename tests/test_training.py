@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,13 @@ from marineworld.train.experiment import (
 )
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.train.pretrain import _prepare_manifest, build_dataloaders, run_pretraining
+
+
+def test_project_tooling_targets_python_311() -> None:
+    config = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+
+    assert config["project"]["requires-python"] == ">=3.11"
+    assert config["tool"]["ruff"]["target-version"] == "py311"
 
 
 def _tiny_model_config() -> dict[str, int | float | str]:

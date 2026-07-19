@@ -7,7 +7,7 @@ name = "marineworld-fm"
 version = "0.0.1"
 description = "Self-supervised multimodal temporal foundation model for maritime perception"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 
 # Deps are grouped: core (always needed for data/alignment utils) and
@@ -48,7 +48,7 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
