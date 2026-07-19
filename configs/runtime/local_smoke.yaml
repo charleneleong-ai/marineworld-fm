@@ -1,6 +1,6 @@
 # Small, deterministic local execution profile.
 tracking_mode: offline
-accelerator: auto
+accelerator: cpu
 devices: 1
 precision: 32-true
 batch_size: 1

@@ -78,3 +78,23 @@ Behaviour:
 ## Reproducibility
 
 All RNGs (torch, cuda, numpy, random) are seeded to **42** via `marineworld.utils.seed.seed_everything`. Splits are made by whole video (never by frame) and are deterministic.
+
+## VideoMAE pretraining
+
+Run the two-step synthetic smoke locally with offline W&B logging:
+
+```bash
+mise run smoke
+```
+
+The smoke covers manifest construction, synthetic decoding, training, validation, and
+best/last checkpoint creation under `outputs/`. To launch the same entrypoint on a single
+GPU, provide the real FVessel root explicitly; both cloud profiles use online W&B logging:
+
+```bash
+MARINEWORLD_DATA_ROOT=/path/to/fvessel mise run train:l4
+MARINEWORLD_DATA_ROOT=/path/to/fvessel mise run train:a100
+```
+
+The L4 and A100 profiles share the data, model, optimization schedule, and trainer behavior.
+They differ only in precision, batch size, gradient accumulation, and data-loader workers.

@@ -47,12 +47,37 @@ class VideoMAEPretrainingModule(LightningModule):
         ).to(device)
 
     def training_step(self, batch: Mapping[str, Any], batch_idx: int) -> torch.Tensor:
+        loss = self._reconstruction_loss(batch, batch_idx, stage="training")
+        self.log(
+            "pretrain/loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=len(batch["pixel_values"]),
+        )
+        return loss
+
+    def validation_step(self, batch: Mapping[str, Any], batch_idx: int) -> torch.Tensor:
+        loss = self._reconstruction_loss(batch, batch_idx, stage="validation")
+        self.log(
+            "val/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=len(batch["pixel_values"]),
+        )
+        return loss
+
+    def _reconstruction_loss(
+        self, batch: Mapping[str, Any], batch_idx: int, *, stage: str
+    ) -> torch.Tensor:
         pixel_values = batch["pixel_values"]
         mask = self.make_mask(pixel_values.shape[0], pixel_values.device)
         loss = self.model(pixel_values=pixel_values, bool_masked_pos=mask).loss
         if loss is None or not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite training loss at batch {batch_idx}")
-        self.log("pretrain/loss", loss, on_step=True, on_epoch=True, sync_dist=False)
+            raise FloatingPointError(f"non-finite {stage} loss at batch {batch_idx}")
         return loss
 
     def configure_optimizers(self) -> torch.optim.Optimizer:

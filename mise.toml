@@ -25,6 +25,13 @@ python = "3.11.9"
 # Run tests with verbose output and stop on first failure.
 "test:fail-fast" = "pytest -v -x tests/"
 
+# End-to-end synthetic VideoMAE smoke with local-only W&B logging.
+"smoke" = "WANDB_MODE=offline uv run --extra train python -m marineworld.train.pretrain data=synthetic model=videomae_tiny runtime=local_smoke"
+
+# Single-GPU runs require an explicit real-data root.
+"train:l4" = "test -n \"$MARINEWORLD_DATA_ROOT\" && WANDB_MODE=online uv run --extra train python -m marineworld.train.pretrain runtime=l4 data.root=\"$MARINEWORLD_DATA_ROOT\""
+"train:a100" = "test -n \"$MARINEWORLD_DATA_ROOT\" && WANDB_MODE=online uv run --extra train python -m marineworld.train.pretrain runtime=a100 data.root=\"$MARINEWORLD_DATA_ROOT\""
+
 # Download FVessel + SMD (placeholder; requires manual download from HF/sources).
 "download:datasets" = """
 echo 'FVessel: https://huggingface.co/datasets/gy65896/FVessel'
