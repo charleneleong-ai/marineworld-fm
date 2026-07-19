@@ -13,6 +13,8 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .mise.local.toml
+.worktrees/
+.superpowers/
 
 # Data + artifacts (keep out of VCS; committed splits live under configs/splits)
 data/raw/
