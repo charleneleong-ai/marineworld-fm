@@ -12,13 +12,15 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from scipy.io import savemat
 
-from marineworld.data import video
+from marineworld.data import video as video_module
 from marineworld.data.adapters import DatasetAdapter, build_adapter
 from marineworld.data.clips import (
     AutoVideoDecoder,
     DecordVideoDecoder,
     MaritimeClipDataset,
+    SpatialTransform,
     SyntheticVideoDecoder,
     build_clip_index,
 )
@@ -73,6 +75,10 @@ def _backend_unavailable(*_args: object) -> NoReturn:
     raise VideoBackendUnavailable("unavailable")
 
 
+def _frames_96(_: Path) -> int:
+    return 96
+
+
 def _target(frame_index: int) -> FrameTargets:
     return FrameTargets(
         frame_index=frame_index,
@@ -102,7 +108,25 @@ def _smd_adapter(tmp_path: Path) -> tuple[DatasetAdapter, Path]:
     video = root / "VIS_Onshore" / "onshore-01.avi"
     video.parent.mkdir(parents=True)
     video.touch()
-    return SMDAdapter(version="fixture"), root
+    return SMDAdapter(version="fixture", num_frames=16), root
+
+
+def _write_smd_objectgt(
+    path: Path,
+    frames: list[tuple[list[list[float]], list[int]]],
+) -> None:
+    """Write the native SMD `structXML` shape used by the public converter."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    struct_xml = np.empty(
+        (1, len(frames)),
+        dtype=[("BB", object), ("Object", object), ("Motion", object), ("Distance", object)],
+    )
+    for index, (boxes, classes) in enumerate(frames):
+        struct_xml["BB"][0, index] = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
+        struct_xml["Object"][0, index] = np.asarray(classes, dtype=np.float64).reshape(-1, 1)
+        struct_xml["Motion"][0, index] = np.empty((0, 1), dtype=np.float64)
+        struct_xml["Distance"][0, index] = np.empty((0, 1), dtype=np.float64)
+    savemat(path, {"structXML": struct_xml})
 
 
 def test_manifest_rejects_video_leakage(tmp_path: Path):
@@ -191,6 +215,119 @@ def test_fvessel_parses_mot_targets(tmp_path: Path) -> None:
     assert targets[0].track_ids.tolist() == [7]
 
 
+def test_smd_pairs_native_objectgt_and_parses_vessel_targets(tmp_path: Path) -> None:
+    root = tmp_path / "smd"
+    video = root / "VIS_Onshore" / "MVI_1478_VIS.avi"
+    video.parent.mkdir(parents=True)
+    video.touch()
+    annotation = video.parent / "ObjectGT" / "MVI_1478_VIS_ObjectGT.mat"
+    _write_smd_objectgt(
+        annotation,
+        [
+            (
+                [
+                    [10, 20, 30, 40],
+                    [1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                    [9, 10, 11, 12],
+                    [0, 0, 0, 0],
+                ],
+                [3, 8, 7, 2, 0],
+            ),
+            ([], []),
+        ],
+    )
+    adapter = SMDAdapter(num_frames=2, annotation_format="smd_objectgt_mat")
+
+    record = adapter.build_manifest(root).records[0]
+    targets = adapter.load_targets(record)
+
+    assert record.annotation_path == annotation
+    assert record.metadata["annotation_format"] == "smd_objectgt_mat"
+    assert [target.frame_index for target in targets] == [0, 1]
+    assert targets[0].boxes_xyxy.tolist() == [[10.0, 20.0, 40.0, 60.0], [5.0, 6.0, 12.0, 14.0]]
+    assert targets[0].class_ids.tolist() == [3, 7]
+    assert targets[1].boxes_xyxy.shape == (0, 4)
+    assert targets[1].class_ids.shape == (0,)
+
+
+def test_smd_rejects_orphan_objectgt_filename(tmp_path: Path) -> None:
+    root = tmp_path / "smd"
+    video = root / "NIR" / "MVI_1_NIR.avi"
+    video.parent.mkdir(parents=True)
+    video.touch()
+    _write_smd_objectgt(video.parent / "ObjectGT" / "MVI_2_NIR_ObjectGT.mat", [([], [])])
+
+    with pytest.raises(ValueError, match="does not pair with an SMD video"):
+        SMDAdapter(num_frames=1).build_manifest(root)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"unexpected": np.ones(1)}, "required root 'structXML'"),
+        (
+            {"structXML": np.empty((1, 1), dtype=[("BB", object)])},
+            "required fields",
+        ),
+    ],
+)
+def test_smd_rejects_malformed_objectgt_schema(
+    tmp_path: Path, payload: dict[str, np.ndarray], message: str
+) -> None:
+    root = tmp_path / "smd"
+    video = root / "VIS_Onboard" / "MVI_1_VIS.avi"
+    video.parent.mkdir(parents=True)
+    video.touch()
+    annotation = video.parent / "ObjectGT" / "MVI_1_VIS_ObjectGT.mat"
+    annotation.parent.mkdir()
+    if "structXML" in payload:
+        payload["structXML"]["BB"][0, 0] = np.empty((0, 4))
+    savemat(annotation, payload)
+    record = SMDAdapter(num_frames=1).build_manifest(root).records[0]
+
+    with pytest.raises(ValueError, match=message):
+        SMDAdapter(num_frames=1).load_targets(record)
+
+
+def test_smd_rejects_objectgt_box_class_length_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "smd"
+    video = root / "VIS_Onboard" / "MVI_1_VIS.avi"
+    video.parent.mkdir(parents=True)
+    video.touch()
+    annotation = video.parent / "ObjectGT" / "MVI_1_VIS_ObjectGT.mat"
+    _write_smd_objectgt(annotation, [([[1, 2, 3, 4], [5, 6, 7, 8]], [3])])
+    record = SMDAdapter(num_frames=1).build_manifest(root).records[0]
+
+    with pytest.raises(ValueError, match="frame 0 has 2 boxes but 1 class labels"):
+        SMDAdapter(num_frames=1).load_targets(record)
+
+
+def test_smd_rejects_objectgt_frame_count_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "smd"
+    video = root / "NIR" / "MVI_1_NIR.avi"
+    video.parent.mkdir(parents=True)
+    video.touch()
+    _write_smd_objectgt(video.parent / "ObjectGT" / "MVI_1_NIR_ObjectGT.mat", [([], [])])
+    adapter = SMDAdapter(num_frames=2)
+    record = adapter.build_manifest(root).records[0]
+
+    with pytest.raises(ValueError, match="contains 1 frames but video manifest declares 2"):
+        adapter.load_targets(record)
+
+
+def test_smd_rejects_unknown_annotation_format(tmp_path: Path) -> None:
+    _, root = _smd_adapter(tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported SMD annotation_format"):
+        SMDAdapter(num_frames=1, annotation_format="auto").build_manifest(root)
+
+
+def test_real_adapter_defaults_probe_source_frame_counts() -> None:
+    assert FVesselAdapter().num_frames is None
+    assert SMDAdapter().num_frames is None
+
+
 def test_fvessel_probes_fps_when_not_explicit(tmp_path: Path) -> None:
     _, root = _fvessel_adapter(tmp_path)
     adapter = FVesselAdapter(version="fixture", fps=None, num_frames=16, fps_probe=_fps_25)
@@ -215,6 +352,29 @@ def test_fvessel_rejects_invalid_probed_fps(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="FPS must be positive"):
         adapter.build_manifest(root)
+
+
+@pytest.mark.parametrize("dataset", ["fvessel", "smd"])
+def test_real_adapters_probe_source_frame_counts(dataset: str, tmp_path: Path) -> None:
+    if dataset == "fvessel":
+        _, root = _fvessel_adapter(tmp_path)
+        adapter = FVesselAdapter(
+            version="fixture",
+            fps=30.0,
+            num_frames=None,
+            frame_count_probe=_frames_96,
+        )
+    else:
+        _, root = _smd_adapter(tmp_path)
+        adapter = SMDAdapter(
+            version="fixture",
+            num_frames=None,
+            frame_count_probe=_frames_96,
+        )
+
+    record = adapter.build_manifest(root).records[0]
+
+    assert record.num_frames == 96
 
 
 def test_build_adapter_instantiates_configured_target() -> None:
@@ -291,6 +451,31 @@ def test_clip_dataset_returns_canonical_tensor(synthetic_manifest: DatasetManife
     assert sample["frame_indices"].tolist() == [0, 1, 2, 3]
 
 
+def test_clip_dataset_maps_non_square_source_boxes_to_square_output(
+    synthetic_manifest: DatasetManifest,
+) -> None:
+    dataset = MaritimeClipDataset(
+        synthetic_manifest,
+        SyntheticVideoDecoder(height=20, width=40),
+        split="train",
+        frames=4,
+        stride=1,
+        image_size=10,
+        seed=42,
+    )
+
+    transform = dataset[0]["spatial_transform"]
+    boxes = np.array([[4.0, 2.0, 20.0, 10.0]], dtype=np.float32)
+
+    assert transform == SpatialTransform(
+        source_size=(20, 40),
+        output_size=(10, 10),
+        scale=(0.5, 0.25),
+        offset=(0.0, 0.0),
+    )
+    assert transform.apply_boxes_xyxy(boxes).tolist() == [[1.0, 1.0, 5.0, 5.0]]
+
+
 def test_clip_dataset_rejects_wrong_decoder_length(
     synthetic_manifest: DatasetManifest,
 ) -> None:
@@ -326,8 +511,8 @@ def test_auto_decoder_prefers_decord(
 ) -> None:
     calls: list[str] = []
     frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
-    monkeypatch.setattr(video, "_decord_decode", lambda *_: calls.append("decord") or frames)
-    monkeypatch.setattr(video, "_pyav_decode", lambda *_: calls.append("pyav") or frames)
+    monkeypatch.setattr(video_module, "_decord_decode", lambda *_: calls.append("decord") or frames)
+    monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: calls.append("pyav") or frames)
 
     AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
 
@@ -338,8 +523,8 @@ def test_auto_decoder_falls_back_to_pyav(
     synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     frames = torch.tensor([2, 0, 2], dtype=torch.uint8).view(3, 1, 1, 1).expand(-1, 3, 2, 2)
-    monkeypatch.setattr(video, "_decord_decode", _backend_unavailable)
-    monkeypatch.setattr(video, "_pyav_decode", lambda *_: frames)
+    monkeypatch.setattr(video_module, "_decord_decode", _backend_unavailable)
+    monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: frames)
 
     decoded = AutoVideoDecoder().decode(synthetic_manifest.records[0], (2, 0, 2))
 
@@ -349,8 +534,8 @@ def test_auto_decoder_falls_back_to_pyav(
 def test_auto_decoder_names_both_missing_backends(
     synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(video, "_decord_decode", _backend_unavailable)
-    monkeypatch.setattr(video, "_pyav_decode", _backend_unavailable)
+    monkeypatch.setattr(video_module, "_decord_decode", _backend_unavailable)
+    monkeypatch.setattr(video_module, "_pyav_decode", _backend_unavailable)
 
     with pytest.raises(RuntimeError, match="decord.*PyAV"):
         AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
@@ -359,8 +544,10 @@ def test_auto_decoder_names_both_missing_backends(
 def test_video_probe_prefers_decord(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     calls: list[str] = []
     expected = VideoMetadata(frame_count=12, fps=25.0)
-    monkeypatch.setattr(video, "_decord_probe", lambda *_: calls.append("decord") or expected)
-    monkeypatch.setattr(video, "_pyav_probe", lambda *_: calls.append("pyav") or expected)
+    monkeypatch.setattr(
+        video_module, "_decord_probe", lambda *_: calls.append("decord") or expected
+    )
+    monkeypatch.setattr(video_module, "_pyav_probe", lambda *_: calls.append("pyav") or expected)
 
     assert probe_video(tmp_path / "clip.mp4") == expected
     assert calls == ["decord"]
@@ -368,8 +555,8 @@ def test_video_probe_prefers_decord(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 def test_video_probe_falls_back_to_pyav(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     expected = VideoMetadata(frame_count=12, fps=25.0)
-    monkeypatch.setattr(video, "_decord_probe", _backend_unavailable)
-    monkeypatch.setattr(video, "_pyav_probe", lambda *_: expected)
+    monkeypatch.setattr(video_module, "_decord_probe", _backend_unavailable)
+    monkeypatch.setattr(video_module, "_pyav_probe", lambda *_: expected)
 
     assert probe_video(tmp_path / "clip.mp4") == expected
 
@@ -381,7 +568,7 @@ def test_video_probe_falls_back_to_pyav(monkeypatch: pytest.MonkeyPatch, tmp_pat
 def test_video_probe_rejects_non_positive_metadata(
     metadata: VideoMetadata, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(video, "_decord_probe", lambda *_: metadata)
+    monkeypatch.setattr(video_module, "_decord_probe", lambda *_: metadata)
 
     with pytest.raises(ValueError, match="positive"):
         probe_video(tmp_path / "private" / "clip.mp4")

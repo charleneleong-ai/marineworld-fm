@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +21,8 @@ from marineworld.data.clips import (
     VideoDecoder,
 )
 from marineworld.data.contracts import DatasetManifest
-from marineworld.data.manifest import manifest_checksum, validate_manifest
-from marineworld.data.splits import split_by_video
+from marineworld.data.manifest import manifest_checksum
+from marineworld.data.splits import prepare_manifest_splits
 from marineworld.train.experiment import build_run_identity, build_wandb_logger
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.utils.seed import seed_everything
@@ -157,51 +156,13 @@ def run_pretraining(cfg: DictConfig) -> Path:
 
 
 def _prepare_manifest(cfg: DictConfig, manifest: DatasetManifest) -> DatasetManifest:
-    if not manifest.records:
-        raise ValueError("manifest contains no records")
-    validate_manifest(manifest)
-
-    if all(record.split == "train" for record in manifest.records) and cfg.data.get("split"):
-        if len(manifest.records) < 2:
-            raise ValueError("at least two videos are required for train and validation splits")
-        partition = split_by_video(
-            [record.id for record in manifest.records],
-            val_frac=float(cfg.data.split.val_frac),
-            test_frac=float(cfg.data.split.test_frac),
-            seed=int(cfg.seed),
-        )
-        train_ids = list(partition.train)
-        val_ids = list(partition.val)
-        test_ids = list(partition.test)
-        if not val_ids:
-            source = train_ids if len(train_ids) > 1 else test_ids
-            val_ids.append(source.pop())
-        if not train_ids:
-            source = test_ids if test_ids else val_ids
-            train_ids.append(source.pop())
-        split_by_id = {
-            record_id: split
-            for split, record_ids in (
-                ("train", train_ids),
-                ("val", val_ids),
-                ("test", test_ids),
-            )
-            for record_id in record_ids
-        }
-        manifest = replace(
-            manifest,
-            records=tuple(
-                replace(record, split=split_by_id[record.id]) for record in manifest.records
-            ),
-        )
-        validate_manifest(manifest)
-
-    splits = {record.split for record in manifest.records}
-    if "train" not in splits:
-        raise ValueError("manifest contains no training records")
-    if "val" not in splits:
-        raise ValueError("manifest contains no validation records")
-    return manifest
+    split = cfg.data.get("split")
+    return prepare_manifest_splits(
+        manifest,
+        val_frac=float(split.val_frac) if split else None,
+        test_frac=float(split.test_frac) if split else None,
+        seed=int(cfg.seed),
+    )
 
 
 def _pretraining_collate(samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:

@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+import numpy as np
 import torch
 import torch.nn.functional as functional
 from torch.utils.data import Dataset
@@ -32,6 +33,27 @@ class ClipIndex:
     record_id: str
     start: int
     frame_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SpatialTransform:
+    """Map source-pixel coordinates into a decoded sample's output canvas."""
+
+    source_size: tuple[int, int]
+    output_size: tuple[int, int]
+    scale: tuple[float, float]
+    offset: tuple[float, float] = (0.0, 0.0)
+
+    def apply_boxes_xyxy(self, boxes: np.ndarray) -> np.ndarray:
+        """Apply resize/crop geometry to source ``[x1,y1,x2,y2]`` boxes."""
+        transformed = np.asarray(boxes, dtype=np.float32).copy()
+        if transformed.ndim != 2 or transformed.shape[1] != 4:
+            raise ValueError("boxes must be shaped [N, 4]")
+        scale_y, scale_x = self.scale
+        offset_y, offset_x = self.offset
+        transformed[:, (0, 2)] = transformed[:, (0, 2)] * scale_x + offset_x
+        transformed[:, (1, 3)] = transformed[:, (1, 3)] * scale_y + offset_y
+        return transformed
 
 
 class DecordVideoDecoder:
@@ -130,11 +152,11 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         split: Split,
         frames: int,
         stride: int,
-        image_size: int,
+        image_size: int | None,
         seed: int,
         target_loader: TargetLoader | None = None,
     ) -> None:
-        if image_size <= 0:
+        if image_size is not None and image_size <= 0:
             raise ValueError("image_size must be positive")
         self.records = {record.id: record for record in manifest.records if record.split == split}
         self.clips = build_clip_index(
@@ -159,13 +181,33 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
                 f"record {record.id}: expected {expected_frames} decoded frames, "
                 f"got {actual_frames}"
             )
+        transform = self.spatial_transform(frames)
         return {
             "pixel_values": self.transform(frames),
             "frame_indices": torch.tensor(clip.frame_indices, dtype=torch.long),
             "record_id": record.id,
             "dataset": record.dataset,
             "targets": self.targets_for(record, clip.frame_indices),
+            "is_labelled": record.dataset == "synthetic" or record.annotation_path is not None,
+            "spatial_transform": transform,
         }
+
+    def spatial_transform(self, frames: torch.Tensor) -> SpatialTransform:
+        if frames.ndim != 4 or frames.shape[1] != 3:
+            raise ValueError("decoder must return frames shaped [T, 3, H, W]")
+        source_height, source_width = frames.shape[-2:]
+        if self.image_size is None:
+            return SpatialTransform(
+                source_size=(source_height, source_width),
+                output_size=(source_height, source_width),
+                scale=(1.0, 1.0),
+            )
+        output_size = (self.image_size, self.image_size)
+        return SpatialTransform(
+            source_size=(source_height, source_width),
+            output_size=output_size,
+            scale=(self.image_size / source_height, self.image_size / source_width),
+        )
 
     def targets_for(
         self, record: VideoRecord, frame_indices: Sequence[int]
@@ -187,6 +229,8 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         pixel_values = frames.to(dtype=torch.float32)
         if not torch.is_floating_point(frames):
             pixel_values = pixel_values / 255.0
+        if self.image_size is None:
+            return pixel_values
         return functional.interpolate(
             pixel_values,
             size=(self.image_size, self.image_size),

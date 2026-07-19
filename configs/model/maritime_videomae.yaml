@@ -1,0 +1,7 @@
+defaults:
+  - videomae_vit_small
+  - _self_
+
+name: maritime_videomae_small
+condition: maritime_videomae
+checkpoint: null

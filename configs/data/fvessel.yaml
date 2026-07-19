@@ -1,7 +1,7 @@
 # FVessel dataset config (video + AIS).
 name: fvessel
 root: data/raw/fvessel
-num_frames: 16
+num_frames: null
 image_size: 224
 adapter:
   _target_: marineworld.data.fvessel.FVesselAdapter
