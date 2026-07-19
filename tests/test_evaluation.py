@@ -32,6 +32,7 @@ from transformers import (
     VJEPA2VideoProcessor,
 )
 
+import marineworld.eval.run_probes as probe_runner
 from marineworld.data.clips import SpatialTransform, build_clip_index
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 from marineworld.data.fvessel import FVesselAdapter
@@ -54,17 +55,23 @@ from marineworld.eval.probes import (
     evaluate_probe,
     fit_dense_probe,
     fit_linear_probe,
+    masked_reconstruction_diagnostic,
+    nearest_neighbour_diagnostic,
     sample_labelled_records,
 )
 from marineworld.eval.run_probes import (
     ProbeRun,
+    _build_probe_dataset,
     _checkpoint_identity,
+    _checkpoint_reconstruction_diagnostic,
     _count_bin,
     _dense_batch_factory,
     _dense_token_labels,
     _has_supervised_labels,
     _labelled_training_records,
+    _log_diagnostic_artifact,
     _log_selection_manifest,
+    _prepare_diagnostic_path,
     _prepare_probe_manifest,
     _probe_run_identity,
     _sample_label,
@@ -74,6 +81,236 @@ from marineworld.eval.run_probes import (
     run_probe_condition,
 )
 from marineworld.train.experiment import build_run_identity
+from marineworld.train.module import VideoMAEPretrainingModule
+
+
+def test_nearest_neighbour_diagnostic_is_bounded_and_reports_matches() -> None:
+    references = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+    queries = torch.tensor([[0.9, 0.1]])
+
+    result = nearest_neighbour_diagnostic(
+        queries,
+        references,
+        query_ids=("query",),
+        reference_ids=("east", "north", "west"),
+        max_references=2,
+    )
+
+    assert result == ({"query_id": "query", "neighbour_id": "east", "rank": 1},)
+
+
+def test_nearest_neighbour_diagnostic_rejects_empty_reference_corpus() -> None:
+    with pytest.raises(ValueError, match="nonempty reference corpus"):
+        nearest_neighbour_diagnostic(
+            torch.ones(1, 2),
+            torch.empty(0, 2),
+            query_ids=("query",),
+            reference_ids=(),
+        )
+
+
+def test_masked_reconstruction_diagnostic_only_scores_masked_tokens() -> None:
+    prediction = torch.tensor([[1.0, 10.0, 3.0]])
+    target = torch.tensor([[2.0, 999.0, 1.0]])
+    mask = torch.tensor([[True, False, True]])
+
+    assert masked_reconstruction_diagnostic(prediction, target, mask) == {
+        "masked_mse": 2.5,
+        "masked_tokens": 2,
+    }
+
+
+def test_diagnostic_artifact_hook_logs_local_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "representation_diagnostics.json"
+    path.write_text("{}")
+    logged: list[object] = []
+    artifact = SimpleNamespace(add_file=lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "marineworld.eval.run_probes._wandb_artifact_type", lambda: lambda **_kwargs: artifact
+    )
+    logger = SimpleNamespace(experiment=SimpleNamespace(log_artifact=logged.append))
+
+    _log_diagnostic_artifact(path, logger)
+
+    assert logged == [artifact]
+
+
+def test_diagnostic_path_removes_stale_prior_invocation(tmp_path: Path) -> None:
+    stale = tmp_path / "representation_diagnostics.json"
+    stale.write_text('{"checkpoint": "old"}')
+
+    path = _prepare_diagnostic_path(tmp_path)
+
+    assert path == stale
+    assert not path.exists()
+
+
+def test_runner_does_not_log_or_retain_stale_diagnostics_for_matrix(tmp_path: Path) -> None:
+    selected = _probe_config(tmp_path)
+    run_evaluation(selected)
+    path = Path(selected.output_dir) / "representation_diagnostics.json"
+    assert path.is_file()
+
+    matrix = _probe_config(tmp_path)
+    matrix.eval.label_fractions = [0.5, 1.0]
+    run_evaluation(matrix)
+
+    assert not path.exists()
+
+
+def test_maritime_checkpoint_produces_numeric_masked_reconstruction(
+    tmp_path: Path,
+) -> None:
+    cfg = _probe_config(tmp_path)
+    OmegaConf.update(cfg, "model.condition", "maritime_videomae", force_add=True)
+    checkpoint = tmp_path / "tiny.ckpt"
+    module = VideoMAEPretrainingModule(
+        {key: value for key, value in cfg.model.items() if key not in {"condition", "checkpoint"}}
+    )
+    torch.save({"state_dict": module.state_dict()}, checkpoint)
+    OmegaConf.update(cfg, "eval.checkpoint", str(checkpoint))
+    adapter = SyntheticAdapter(num_frames=int(cfg.model.num_frames), num_videos=2)
+    manifest = adapter.build_manifest(tmp_path / "data")
+
+    result = _checkpoint_reconstruction_diagnostic(cfg, manifest, adapter, FakeEncoder())
+
+    assert result["status"] == "completed"
+    assert float(result["masked_loss"]) >= 0
+
+
+def test_processorless_probe_uses_training_normalization(tmp_path: Path) -> None:
+    cfg = _probe_config(tmp_path)
+    adapter = SyntheticAdapter(num_frames=4, num_videos=2)
+    manifest = adapter.build_manifest(tmp_path / "data")
+
+    sample = _build_probe_dataset(cfg, manifest, adapter, FakeEncoder(), split="train")[0]
+
+    assert sample["pixel_values"][0, 0, 0, 0].item() == pytest.approx(-0.485 / 0.229)
+
+
+def test_final_scalar_probe_keeps_selected_train_subset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _probe_config(tmp_path)
+    cfg.eval.report_test = True
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    records = tuple(
+        VideoRecord(name, "synthetic", video, split, "generated", 10.0, 4)
+        for name, split in (("train-a", "train"), ("val-a", "val"), ("test-a", "test"))
+    )
+    manifest = DatasetManifest("synthetic", "1", "MIT", records)
+    sets = {
+        "train": probe_runner._FeatureSet(
+            torch.eye(3),
+            torch.tensor([0, 1, 0]),
+            ("train-a", "train-b", "train-c"),
+            ("generated",) * 3,
+            ("synthetic",) * 3,
+        ),
+        "val": probe_runner._FeatureSet(
+            torch.eye(2, 3),
+            torch.tensor([0, 1]),
+            ("val-a", "val-b"),
+            ("generated",) * 2,
+            ("synthetic",) * 2,
+        ),
+        "test": probe_runner._FeatureSet(
+            torch.eye(2, 3),
+            torch.tensor([0, 1]),
+            ("test-a", "test-b"),
+            ("generated",) * 2,
+            ("synthetic",) * 2,
+        ),
+    }
+    monkeypatch.setattr(probe_runner, "_extract_features", lambda *_args, split, **_kw: sets[split])
+    fit_sizes: list[int] = []
+    fitted = object()
+    monkeypatch.setattr(
+        probe_runner,
+        "fit_linear_probe",
+        lambda _encoder, features, _labels, **_kw: fit_sizes.append(len(features)) or fitted,
+    )
+    evaluated: list[object] = []
+    monkeypatch.setattr(
+        probe_runner,
+        "evaluate_probe",
+        lambda probe, *_args, **_kw: evaluated.append(probe) or ("macro_f1", 1.0),
+    )
+    run = ProbeRun(
+        "random",
+        "random-init",
+        "checksum",
+        "synthetic",
+        "classification",
+        0.01,
+        42,
+        "macro_f1",
+        "tiny",
+        "cpu",
+        selected_record_ids=("train-a", "train-b"),
+    )
+
+    results = probe_runner._evaluate_runs(cfg, manifest, SyntheticAdapter(), FakeEncoder(), (run,))
+
+    assert fit_sizes == [2]
+    assert evaluated == [fitted, fitted]
+    assert [result.evaluation_split for result in results] == ["val", "test"]
+
+
+def test_dense_selected_train_head_reports_heldout_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _probe_config(tmp_path)
+    cfg.eval.task = "dense"
+    cfg.eval.report_test = True
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    manifest = DatasetManifest(
+        "synthetic",
+        "1",
+        "MIT",
+        tuple(
+            VideoRecord(split, "synthetic", video, split, "generated", 10.0, 4)
+            for split in ("train", "val", "test")
+        ),
+    )
+    monkeypatch.setattr(probe_runner, "_build_probe_dataset", lambda *_args, split, **_kw: split)
+    selected_sets: list[set[str] | None] = []
+    monkeypatch.setattr(
+        probe_runner,
+        "_dense_batch_factory",
+        lambda _dataset, _encoder, *, record_ids=None, **_kw: (
+            selected_sets.append(record_ids) or (lambda: iter(()))
+        ),
+    )
+    head = torch.nn.Linear(1, 2)
+    monkeypatch.setattr(probe_runner, "fit_dense_probe_streaming", lambda *_a, **_k: head)
+    monkeypatch.setattr(
+        probe_runner, "evaluate_dense_probe_streaming", lambda *_a, **_k: ("macro_f1", 0.5)
+    )
+    run = ProbeRun(
+        "random",
+        "random-init",
+        "checksum",
+        "synthetic",
+        "dense",
+        0.01,
+        42,
+        "macro_f1",
+        "tiny",
+        "cpu",
+        selected_record_ids=("train",),
+    )
+
+    results = probe_runner._evaluate_dense_runs(
+        cfg, manifest, SyntheticAdapter(), FakeEncoder(), (run,)
+    )
+
+    assert selected_sets[1] == {"train"}
+    assert [result.evaluation_split for result in results] == ["val", "test"]
 
 
 class FakeEncoder(torch.nn.Module):

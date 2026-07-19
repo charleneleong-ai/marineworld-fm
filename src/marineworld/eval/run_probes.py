@@ -8,7 +8,7 @@ import math
 import os
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from marineworld.data.adapters import DatasetAdapter, build_adapter
+from marineworld.data.adapters import DatasetAdapter, build_adapter, build_data_adapter
 from marineworld.data.clips import (
     DecordVideoDecoder,
     MaritimeClipDataset,
@@ -43,9 +43,11 @@ from marineworld.eval.probes import (
     evaluate_probe,
     fit_dense_probe_streaming,
     fit_linear_probe,
+    nearest_neighbour_diagnostic,
     sample_labelled_records,
 )
 from marineworld.train.experiment import RunIdentity, build_run_identity, build_wandb_logger
+from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.utils.seed import seed_everything
 
 
@@ -70,6 +72,8 @@ class _FeatureSet:
     features: torch.Tensor
     labels: torch.Tensor
     record_ids: tuple[str, ...]
+    sources: tuple[str, ...]
+    datasets: tuple[str, ...]
 
 
 def run_probe_condition(
@@ -92,7 +96,11 @@ def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
     """Run the configured frozen probe matrix and log one results table."""
     _validate_probe_config(cfg)
     seed_everything(int(cfg.seed))
-    adapter = build_adapter(cfg.data.adapter)
+    adapter = (
+        build_data_adapter(cfg.data)
+        if cfg.data.get("components")
+        else build_adapter(cfg.data.adapter)
+    )
     manifest = adapter.build_manifest(Path(cfg.data.root))
     validate_manifest(manifest)
     split_error: SplitUnavailableError | None = None
@@ -141,6 +149,7 @@ def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
     )
     identity = _probe_run_identity(cfg, manifest, checkpoint_ref, revision)
     logger = build_wandb_logger(_tracking_config(cfg), identity)
+    diagnostic_path = _prepare_diagnostic_path(Path(cfg.output_dir))
     try:
         selection_path = _write_selection_manifest(cfg, manifest, runs)
         _log_selection_manifest(selection_path, identity.run_id, logger)
@@ -166,6 +175,8 @@ def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
         if len(results) == 1 and results[0].status == "SKIPPED_RESOURCE":
             results = tuple(_skipped_result(run) for run in runs)
         log_probe_results(results, logger)
+        if diagnostic_path.is_file():
+            _log_diagnostic_artifact(diagnostic_path, logger)
         return results
     finally:
         if logger is not False:
@@ -270,6 +281,7 @@ def _probe_run_identity(
             "dense_lr": float(cfg.eval.dense_lr) if task == "dense" else None,
             "label_fractions": sorted(float(value) for value in cfg.eval.label_fractions),
             "model_config": model_config,
+            "transforms": OmegaConf.to_container(cfg.data.transforms, resolve=True),
             "seeds": sorted(int(value) for value in cfg.eval.seeds),
             "task": task,
         },
@@ -303,6 +315,8 @@ def _validate_probe_config(cfg: DictConfig) -> None:
         raise ValueError("eval.label_fractions must be a nonempty list of unique values")
     if any(not math.isfinite(value) or not 0 < value <= 1 for value in fractions):
         raise ValueError("eval.label_fractions values must be finite and in (0, 1]")
+    if bool(cfg.eval.get("report_test", False)) and (len(seeds) != 1 or len(fractions) != 1):
+        raise ValueError("eval.report_test requires exactly one selected seed and label fraction")
     _require_positive_int("eval.batch_size", cfg.eval.batch_size)
     _require_positive_int("eval.dense_epochs", cfg.eval.dense_epochs)
     try:
@@ -404,6 +418,10 @@ def _evaluate_runs(
         return tuple(_unavailable_result(run) for run in runs)
     if validation.labels.unique().numel() < 2:
         return tuple(_degenerate_result(run) for run in runs)
+    if len(runs) == 1:
+        _write_representation_diagnostics(
+            cfg, runs[0], train, validation, manifest, adapter, encoder
+        )
     results = []
     for run in runs:
         selected = set(run.selected_record_ids)
@@ -443,10 +461,161 @@ def _evaluate_runs(
                 status="COMPLETED",
                 model=run.model,
                 device=run.device,
+                evaluation_split="val",
                 **_subset_metadata(run.selected_record_ids),
             )
         )
+        test_records = [record for record in manifest.records if record.split == "test"]
+        if not bool(cfg.eval.get("report_test", False)) or not test_records:
+            continue
+        try:
+            test = _extract_features(cfg, manifest, adapter, encoder, split="test")
+        except LabelsUnavailableError:
+            continue
+        final_probe = probe
+        metric, value = evaluate_probe(final_probe, test.features, test.labels, task=run.task)
+        results.append(
+            ProbeResult(
+                condition=run.condition,
+                checkpoint=run.checkpoint,
+                manifest_checksum=run.manifest_checksum,
+                dataset=run.dataset,
+                task=run.task,
+                fraction=run.fraction,
+                seed=run.seed,
+                metric=metric,
+                value=value,
+                status="COMPLETED",
+                model=run.model,
+                device=run.device,
+                evaluation_split="test",
+                **_subset_metadata(run.selected_record_ids),
+            )
+        )
+        smd_sources = {
+            source
+            for dataset, source in zip(test.datasets, test.sources, strict=True)
+            if dataset == "smd"
+        }
+        for source in sorted(smd_sources):
+            source_indices = [
+                i
+                for i, (dataset, value) in enumerate(zip(test.datasets, test.sources, strict=True))
+                if dataset == "smd" and value == source
+            ]
+            if not source_indices:
+                continue
+            source_metric, source_value = evaluate_probe(
+                final_probe,
+                test.features[source_indices],
+                test.labels[source_indices],
+                task=run.task,
+            )
+            results.append(
+                ProbeResult(
+                    condition=run.condition,
+                    checkpoint=run.checkpoint,
+                    manifest_checksum=run.manifest_checksum,
+                    dataset=f"smd/{source}",
+                    task=run.task,
+                    fraction=run.fraction,
+                    seed=run.seed,
+                    metric=source_metric,
+                    value=source_value,
+                    status="COMPLETED",
+                    model=run.model,
+                    device=run.device,
+                    evaluation_split="test",
+                    **_subset_metadata(run.selected_record_ids),
+                )
+            )
     return tuple(results)
+
+
+def _write_representation_diagnostics(
+    cfg: DictConfig,
+    run: ProbeRun,
+    references: _FeatureSet,
+    queries: _FeatureSet,
+    manifest: DatasetManifest,
+    adapter: DatasetAdapter,
+    encoder: FrozenVideoEncoder,
+) -> Path:
+    rows = nearest_neighbour_diagnostic(
+        queries.features,
+        references.features,
+        query_ids=queries.record_ids,
+        reference_ids=references.record_ids,
+        max_references=min(1024, len(references.record_ids)),
+        seed=run.seed,
+    )
+    payload = {
+        "checkpoint": run.checkpoint,
+        "manifest_checksum": run.manifest_checksum,
+        "reference_split": "train",
+        "query_split": "val",
+        "retrieval": list(rows),
+        "query_sources": list(queries.sources),
+        "masked_reconstruction": _checkpoint_reconstruction_diagnostic(
+            cfg, manifest, adapter, encoder
+        ),
+    }
+    path = Path(cfg.output_dir) / "representation_diagnostics.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _checkpoint_reconstruction_diagnostic(
+    cfg: DictConfig,
+    manifest: DatasetManifest,
+    adapter: DatasetAdapter,
+    encoder: FrozenVideoEncoder,
+) -> dict[str, str | float | int]:
+    if str(cfg.model.condition) != "maritime_videomae":
+        return {"status": "unavailable_for_encoder_only_condition"}
+    checkpoint = Path(str(cfg.eval.checkpoint or cfg.model.checkpoint))
+    model_config = OmegaConf.to_container(cfg.model, resolve=True)
+    assert isinstance(model_config, dict)
+    for key in ("condition", "checkpoint", "revision", "pretrained"):
+        model_config.pop(key, None)
+    module = VideoMAEPretrainingModule(model_config, seed=int(cfg.seed))
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    module.load_state_dict(payload["state_dict"])
+    module.eval()
+    dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split="val")
+    if not len(dataset):
+        raise LabelsUnavailableError("masked reconstruction requires a validation clip")
+    pixels = dataset[0]["pixel_values"].unsqueeze(0)
+    mask = module.make_mask(1, torch.device("cpu"), step=0)
+    with torch.inference_mode():
+        loss = module.model(pixel_values=pixels, bool_masked_pos=mask).loss
+    if loss is None or not torch.isfinite(loss):
+        raise ValueError("masked reconstruction produced a non-finite loss")
+    return {
+        "status": "completed",
+        "masked_loss": float(loss),
+        "masked_tokens": int(mask.sum()),
+        "clips": 1,
+    }
+
+
+def _log_diagnostic_artifact(path: Path, logger: Any) -> None:
+    if logger is False or not path.is_file():
+        return
+    provenance = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    artifact = _wandb_artifact_type()(
+        name=f"representation-diagnostics-{provenance}", type="evaluation"
+    )
+    artifact.add_file(str(path), name=path.name)
+    logger.experiment.log_artifact(artifact)
+
+
+def _prepare_diagnostic_path(output_dir: Path) -> Path:
+    """Reserve this invocation's diagnostic path, removing any stale predecessor."""
+    path = output_dir / "representation_diagnostics.json"
+    path.unlink(missing_ok=True)
+    return path
 
 
 def _evaluate_dense_runs(
@@ -496,6 +665,25 @@ def _evaluate_dense_runs(
             results.append(_degenerate_result(run))
             continue
         results.append(_completed_result(run, metric, value))
+        has_test_records = any(record.split == "test" for record in manifest.records)
+        if bool(cfg.eval.get("report_test", False)) and has_test_records:
+            test_dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split="test")
+            test_batches = _dense_batch_factory(
+                test_dataset,
+                encoder,
+                batch_size=int(cfg.eval.batch_size),
+            )
+            try:
+                test_metric, test_value = evaluate_dense_probe_streaming(probe, test_batches)
+            except (LabelsUnavailableError, DegenerateLabelsError):
+                results.append(replace(_unavailable_result(run), evaluation_split="test"))
+            else:
+                results.append(
+                    replace(
+                        _completed_result(run, test_metric, test_value),
+                        evaluation_split="test",
+                    )
+                )
     return tuple(results)
 
 
@@ -533,6 +721,8 @@ def _extract_features(
     feature_batches: list[torch.Tensor] = []
     label_batches: list[torch.Tensor] = []
     record_ids: list[str] = []
+    sources: list[str] = []
+    datasets: list[str] = []
     batch_size = int(cfg.eval.batch_size)
     if batch_size <= 0:
         raise ValueError("probe batch_size must be positive")
@@ -552,12 +742,16 @@ def _extract_features(
         feature_batches.append(encoded.global_features.cpu())
         label_batches.append(torch.tensor(scalar_labels, dtype=torch.long))
         record_ids.extend(str(sample["record_id"]) for sample in samples)
+        sources.extend(str(sample["source"]) for sample in samples)
+        datasets.extend(str(sample["dataset"]) for sample in samples)
     if not feature_batches:
         raise LabelsUnavailableError(f"{split} split produced no labelled probe clips")
     return _FeatureSet(
         torch.cat(feature_batches),
         torch.cat(label_batches),
         tuple(record_ids),
+        tuple(sources),
+        tuple(datasets),
     )
 
 
@@ -583,6 +777,12 @@ def _build_probe_dataset(
         image_size=None if processor_owns_geometry else size,
         seed=int(cfg.seed),
         target_loader=adapter.load_targets,
+        normalization_mean=(
+            tuple(cfg.data.transforms.normalization.mean) if not processor_owns_geometry else None
+        ),
+        normalization_std=(
+            tuple(cfg.data.transforms.normalization.std) if not processor_owns_geometry else None
+        ),
     )
 
 

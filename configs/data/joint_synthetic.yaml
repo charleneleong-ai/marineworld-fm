@@ -1,0 +1,29 @@
+# Offline fixture exercising the same composite/balancing path as data=joint.
+name: maritime_joint
+decoder: synthetic
+root: .
+sampling_weights: {smd: 0.5, fvessel: 0.5}
+components:
+  smd:
+    root: data/raw/joint-synthetic/smd
+    adapter:
+      _target_: marineworld.data.synthetic.SyntheticAdapter
+      version: fixture
+      num_frames: 4
+      num_videos: 2
+  fvessel:
+    root: data/raw/joint-synthetic/fvessel
+    adapter:
+      _target_: marineworld.data.synthetic.SyntheticAdapter
+      version: fixture
+      num_frames: 4
+      num_videos: 2
+transforms:
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  train:
+    color_jitter: 0.1
+split:
+  val_frac: 0.15
+  test_frac: 0.15

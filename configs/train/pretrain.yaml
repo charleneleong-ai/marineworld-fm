@@ -1,11 +1,6 @@
 # Self-supervised pretraining hyperparameters (v1).
 name: pretrain
 epochs: 100
-batch_size: 8
 lr: 1.5e-4
 weight_decay: 0.05
 warmup_epochs: 10
-num_workers: 4
-# "auto" lets Lightning pick cuda/mps/cpu; MPS for Apple silicon.
-accelerator: auto
-precision: 16-mixed
