@@ -31,6 +31,8 @@ train = [
     "decord>=0.6; sys_platform != 'darwin'",  # no macOS distribution
     "wandb>=0.17",
     "motmetrics>=1.4",             # tracking eval (MOTA/IDF1)
+    "scikit-learn>=1.5",
+    "python-dotenv>=1.0",
 ]
 dev = [
     "pytest>=8.0",
