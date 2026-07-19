@@ -1,0 +1,4 @@
+# W&B credentials are read only by the W&B client from the process environment.
+mode: ${runtime.tracking_mode}
+project: marineworld-fm
+entity: null
