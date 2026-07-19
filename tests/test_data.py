@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
+from marineworld.data.adapters import DatasetAdapter, build_adapter
 from marineworld.data.contracts import DatasetManifest, VideoRecord
+from marineworld.data.fvessel import FVesselAdapter
 from marineworld.data.manifest import manifest_checksum, validate_manifest
+from marineworld.data.smd import SMDAdapter
+from marineworld.data.synthetic import SyntheticAdapter
 
 
 def _record(video: Path, *, record_id: str, split: str) -> VideoRecord:
@@ -25,6 +31,40 @@ def _record(video: Path, *, record_id: str, split: str) -> VideoRecord:
 
 def _manifest(*records: VideoRecord) -> DatasetManifest:
     return DatasetManifest("demo", "1", "MIT", records)
+
+
+def _synthetic_adapter(tmp_path: Path) -> tuple[DatasetAdapter, Path]:
+    return SyntheticAdapter(version="fixture", num_videos=2), tmp_path / "synthetic"
+
+
+def _fps_25(_: Path) -> float:
+    return 25.0
+
+
+def _never_probe(_: Path) -> float:
+    raise AssertionError("explicit FPS must bypass probing")
+
+
+def _fps_nan(_: Path) -> float:
+    return float("nan")
+
+
+def _fvessel_adapter(tmp_path: Path) -> tuple[DatasetAdapter, Path]:
+    root = tmp_path / "fvessel"
+    sample = root / "sample-01"
+    (sample / "gt").mkdir(parents=True)
+    (sample / "ais").mkdir()
+    (sample / "sample.mp4").touch()
+    (sample / "gt" / "gt.txt").write_text("1,7,10,20,30,40,1,1,1\n")
+    return FVesselAdapter(version="fixture", fps=30.0), root
+
+
+def _smd_adapter(tmp_path: Path) -> tuple[DatasetAdapter, Path]:
+    root = tmp_path / "smd"
+    video = root / "VIS_Onshore" / "onshore-01.avi"
+    video.parent.mkdir(parents=True)
+    video.touch()
+    return SMDAdapter(version="fixture"), root
 
 
 def test_manifest_rejects_video_leakage(tmp_path: Path):
@@ -90,3 +130,102 @@ def test_manifest_converts_record_membership_to_an_immutable_tuple(tmp_path: Pat
     records.clear()
 
     assert manifest.records == (manifest.records[0],)
+
+
+@pytest.mark.parametrize("adapter_factory", [_synthetic_adapter, _fvessel_adapter, _smd_adapter])
+def test_adapter_produces_valid_manifest(adapter_factory, tmp_path: Path) -> None:
+    adapter, root = adapter_factory(tmp_path)
+
+    manifest = adapter.build_manifest(root)
+
+    validate_manifest(manifest)
+    assert manifest.records
+    assert all(record.dataset == manifest.name for record in manifest.records)
+
+
+def test_fvessel_parses_mot_targets(tmp_path: Path) -> None:
+    adapter, root = _fvessel_adapter(tmp_path)
+    record = adapter.build_manifest(root).records[0]
+
+    targets = adapter.load_targets(record)
+
+    assert targets[0].boxes_xyxy.tolist() == [[10.0, 20.0, 40.0, 60.0]]
+    assert targets[0].track_ids.tolist() == [7]
+
+
+def test_fvessel_probes_fps_when_not_explicit(tmp_path: Path) -> None:
+    _, root = _fvessel_adapter(tmp_path)
+    adapter = FVesselAdapter(version="fixture", fps=None, fps_probe=_fps_25)
+
+    record = adapter.build_manifest(root).records[0]
+
+    assert record.fps == 25.0
+
+
+def test_fvessel_explicit_fps_bypasses_probe(tmp_path: Path) -> None:
+    _, root = _fvessel_adapter(tmp_path)
+    adapter = FVesselAdapter(version="fixture", fps=20.0, fps_probe=_never_probe)
+
+    record = adapter.build_manifest(root).records[0]
+
+    assert record.fps == 20.0
+
+
+def test_fvessel_rejects_invalid_probed_fps(tmp_path: Path) -> None:
+    _, root = _fvessel_adapter(tmp_path)
+    adapter = FVesselAdapter(version="fixture", fps=None, fps_probe=_fps_nan)
+
+    with pytest.raises(ValueError, match="FPS must be positive"):
+        adapter.build_manifest(root)
+
+
+def test_fvessel_default_probe_reports_missing_decord(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, root = _fvessel_adapter(tmp_path)
+    monkeypatch.setitem(sys.modules, "decord", None)
+
+    with pytest.raises(RuntimeError, match="requires optional dependency 'decord'"):
+        FVesselAdapter(version="fixture").build_manifest(root)
+
+
+def test_build_adapter_instantiates_configured_target() -> None:
+    adapter = build_adapter(
+        {
+            "_target_": "marineworld.data.synthetic.SyntheticAdapter",
+            "version": "fixture",
+            "num_videos": 1,
+        }
+    )
+
+    assert isinstance(adapter, SyntheticAdapter)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "adapter_type"),
+    [
+        ("fvessel", FVesselAdapter),
+        ("smd", SMDAdapter),
+        ("synthetic", SyntheticAdapter),
+    ],
+)
+def test_data_config_constructs_its_adapter(
+    config_name: str, adapter_type: type[DatasetAdapter]
+) -> None:
+    config_path = Path(__file__).parents[1] / "configs" / "data" / f"{config_name}.yaml"
+    config = yaml.safe_load(config_path.read_text())
+
+    assert isinstance(build_adapter(config["adapter"]), adapter_type)
+
+
+def test_fvessel_data_config_passes_fps_to_adapter() -> None:
+    config_path = Path(__file__).parents[1] / "configs" / "data" / "fvessel.yaml"
+    config = yaml.safe_load(config_path.read_text())
+
+    assert config["adapter"]["fps"] is None
+    config["adapter"]["fps"] = 20.0
+
+    adapter = build_adapter(config["adapter"])
+
+    assert isinstance(adapter, FVesselAdapter)
+    assert adapter.fps == 20.0

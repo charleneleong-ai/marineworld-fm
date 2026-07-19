@@ -15,8 +15,13 @@ alignment plumbing it depends on is implemented and tested now.
 
 from __future__ import annotations
 
+import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+
+import numpy as np
 
 from marineworld.data.alignment import (
     AISRecord,
@@ -24,8 +29,101 @@ from marineworld.data.alignment import (
     frame_timestamps_ms,
     load_ais_tracks,
 )
+from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 
-__all__ = ["FVesselSample", "load_sample"]
+__all__ = ["FVesselAdapter", "FVesselSample", "load_sample"]
+
+
+def _probe_fps(video: Path) -> float:
+    """Read source FPS with the optional training-time video dependency."""
+    try:
+        # Decord is optional and heavy; only import it when source probing is needed.
+        from decord import VideoReader
+    except ImportError as error:
+        raise RuntimeError(
+            "FVessel FPS probing requires optional dependency 'decord'; "
+            "install the train extra or configure a positive fps"
+        ) from error
+
+    try:
+        return float(VideoReader(str(video)).get_avg_fps())
+    except Exception as error:
+        raise RuntimeError(
+            f"could not probe FPS for {video}; configure a positive fps or provide decodable media"
+        ) from error
+
+
+@dataclass(frozen=True)
+class FVesselAdapter:
+    """Adapt FVessel video samples and their MOT targets to common records."""
+
+    version: str = "v1"
+    fps: float | None = None
+    num_frames: int = 16
+    fps_probe: Callable[[Path], float] = _probe_fps
+
+    def build_manifest(self, root: Path) -> DatasetManifest:
+        records = tuple(self._record(root, video) for video in sorted(root.rglob("*.mp4")))
+        return DatasetManifest("fvessel", self.version, "MIT", records)
+
+    def load_targets(self, record: VideoRecord) -> tuple[FrameTargets, ...]:
+        if record.annotation_path is None:
+            return ()
+
+        frames: dict[int, list[tuple[list[float], int, int]]] = {}
+        with record.annotation_path.open(newline="") as handle:
+            for row in csv.reader(handle):
+                if len(row) < 8:
+                    continue
+                frame, track_id, left, top, width, height, _, class_id = row[:8]
+                frame_index = int(float(frame)) - 1
+                frames.setdefault(frame_index, []).append(
+                    (
+                        [
+                            float(left),
+                            float(top),
+                            float(left) + float(width),
+                            float(top) + float(height),
+                        ],
+                        int(float(class_id)),
+                        int(float(track_id)),
+                    )
+                )
+
+        return tuple(
+            FrameTargets(
+                frame_index=frame_index,
+                boxes_xyxy=np.asarray([box for box, _, _ in entries], dtype=np.float32),
+                class_ids=np.asarray([class_id for _, class_id, _ in entries], dtype=np.int64),
+                track_ids=np.asarray([track_id for _, _, track_id in entries], dtype=np.int64),
+            )
+            for frame_index, entries in sorted(frames.items())
+        )
+
+    def _record(self, root: Path, video: Path) -> VideoRecord:
+        annotation = _mot_path(video.parent)
+        return VideoRecord(
+            id=video.relative_to(root).with_suffix("").as_posix(),
+            dataset="fvessel",
+            video_path=video,
+            split="train",
+            source=video.parent.name,
+            fps=self._source_fps(video),
+            num_frames=self.num_frames,
+            annotation_path=annotation,
+            metadata={"has_ais": (video.parent / "ais").is_dir()},
+        )
+
+    def _source_fps(self, video: Path) -> float:
+        fps = self.fps if self.fps is not None else self.fps_probe(video)
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError(f"FVessel FPS must be positive for {video}, got {fps}")
+        return fps
+
+
+def _mot_path(sample_root: Path) -> Path | None:
+    targets = sorted((sample_root / "gt").glob("*.txt"))
+    return targets[0] if targets else None
 
 
 @dataclass
