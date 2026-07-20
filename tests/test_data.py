@@ -349,14 +349,46 @@ def test_auto_decoder_falls_back_to_pyav(
     assert decoded[:, 0, 0, 0].tolist() == [2, 0, 2]
 
 
+def test_auto_decoder_recovers_from_decord_decode_failure(
+    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
+
+    def fail_decord(*_: object) -> torch.Tensor:
+        raise video.VideoDecodeError("Decord rejected malformed H.264 packets")
+
+    monkeypatch.setattr(video, "_decord_decode", fail_decord)
+    monkeypatch.setattr(video, "_pyav_decode", lambda *_: frames)
+
+    assert AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,)) is frames
+
+
+def test_auto_decoder_does_not_mask_programmer_errors(
+    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = RuntimeError("unexpected tensor contract bug")
+
+    def fail_unexpectedly(*_: object) -> torch.Tensor:
+        raise error
+
+    monkeypatch.setattr(video, "_decord_decode", fail_unexpectedly)
+
+    with pytest.raises(RuntimeError) as caught:
+        AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+    assert caught.value is error
+
+
 def test_auto_decoder_names_both_missing_backends(
     synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(video, "_decord_decode", _backend_unavailable)
     monkeypatch.setattr(video, "_pyav_decode", _backend_unavailable)
 
-    with pytest.raises(RuntimeError, match="decord.*PyAV"):
+    with pytest.raises(RuntimeError, match="decord: unavailable; PyAV: unavailable") as caught:
         AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+    assert isinstance(caught.value.__cause__, VideoBackendUnavailable)
 
 
 def test_video_probe_prefers_decord(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
