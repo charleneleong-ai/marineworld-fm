@@ -22,6 +22,7 @@ class VideoMAEPretrainingModule(LightningModule):
         *,
         lr: float = 1.5e-4,
         weight_decay: float = 0.05,
+        warmup_epochs: int = 0,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -29,6 +30,7 @@ class VideoMAEPretrainingModule(LightningModule):
         self.model = build_videomae(self.model_config)
         self.lr = lr
         self.weight_decay = weight_decay
+        self.warmup_epochs = warmup_epochs
         self.mask_ratio = float(self.model_config["mask_ratio"])
         self.seed = int(self.model_config.get("seed", 42) if seed is None else seed)
 
@@ -80,8 +82,19 @@ class VideoMAEPretrainingModule(LightningModule):
             raise FloatingPointError(f"non-finite {stage} loss at batch {batch_idx}")
         return loss
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+    def configure_optimizers(self) -> torch.optim.Optimizer | dict[str, Any]:
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        if self.warmup_epochs <= 0:
+            return optimizer
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1 / self.warmup_epochs,
+            total_iters=self.warmup_epochs,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
 
 def _sequence_length(config: Any) -> int:

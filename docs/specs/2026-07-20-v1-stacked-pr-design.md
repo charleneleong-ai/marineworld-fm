@@ -15,7 +15,8 @@ as the foundation scaffold and retaining all existing work in recoverable Git hi
    fallback, and safe FVessel Clip-10 acquisition.
 3. `feat/videomae-pretraining` targets `feat/maritime-data-pipeline`. It contains the
    VideoMAE model/module, experiment identity, core W&B logging, and local/L4/A100
-   training entrypoints.
+   training entrypoints, including the bounded real FVessel smoke profile and observed
+   A100/W&B verification evidence.
 4. `feat/representation-evaluation` targets `feat/videomae-pretraining`. It contains
    shared frozen encoders, probes, and bounded diagnostics.
 5. `feat/joint-maritime-pretraining` targets `feat/representation-evaluation`. It
@@ -23,8 +24,9 @@ as the foundation scaffold and retaining all existing work in recoverable Git hi
    behavior.
 6. `feat/wandb-media` targets `feat/joint-maritime-pretraining`. It contains validation
    and best-checkpoint reconstruction previews plus the approved media documentation.
-7. `test/fvessel-smoke` targets `feat/wandb-media`. It contains the bounded real-data
-   runtime profile, real FVessel/W&B verification evidence, and observed run docs.
+
+The originally planned `test/fvessel-smoke` layer was folded into PR #3 so reviewers can
+verify the real data path alongside the pretraining entrypoint it exercises.
 
 ## History strategy
 

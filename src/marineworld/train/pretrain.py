@@ -24,7 +24,7 @@ from marineworld.data.clips import (
 from marineworld.data.contracts import DatasetManifest
 from marineworld.data.manifest import manifest_checksum, validate_manifest
 from marineworld.data.splits import split_by_video
-from marineworld.train.experiment import build_run_identity, build_wandb_logger
+from marineworld.train.experiment import build_run_identity, build_wandb_logger, resolved_config
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.utils.seed import seed_everything
 
@@ -127,32 +127,37 @@ def run_pretraining(cfg: DictConfig) -> Path:
         int(cfg.seed),
         None,
         accelerator=str(cfg.runtime.accelerator),
+        checkpoint_provenance=(str(cfg.runtime.ckpt_path) if cfg.runtime.ckpt_path else None),
+        scientific_config=resolved_config(cfg),
     )
     logger = build_wandb_logger(cfg, identity)
+    checkpoint = _ExceptionSafeModelCheckpoint(
+        dirpath=Path(cfg.output_dir) / "checkpoints",
+        monitor="val/loss",
+        mode="min",
+        save_last=True,
+        save_top_k=1,
+        save_on_exception=True,
+    )
     try:
-        checkpoint = _ExceptionSafeModelCheckpoint(
-            dirpath=Path(cfg.output_dir) / "checkpoints",
-            monitor="val/loss",
-            mode="min",
-            save_last=True,
-            save_top_k=1,
-            save_on_exception=True,
-        )
         trainer = build_trainer(cfg, logger=logger, callbacks=[checkpoint])
         trainer.fit(
             _build_module(cfg),
             **dataloaders,
             ckpt_path=cfg.runtime.ckpt_path,
         )
-    finally:
-        if logger is not False:
-            logger.experiment.finish()
-
-    if not checkpoint.last_model_path:
-        raise RuntimeError("training completed without a last checkpoint path")
-    last_checkpoint = Path(checkpoint.last_model_path)
-    if not last_checkpoint.is_file():
-        raise RuntimeError(f"last checkpoint does not exist: {last_checkpoint}")
+        if not checkpoint.last_model_path:
+            raise RuntimeError("training completed without a last checkpoint path")
+        last_checkpoint = Path(checkpoint.last_model_path)
+        if not last_checkpoint.is_file():
+            raise RuntimeError(f"last checkpoint does not exist: {last_checkpoint}")
+    except BaseException as primary_error:
+        try:
+            _finish_wandb(logger, exit_code=1)
+        except BaseException as cleanup_error:
+            primary_error.add_note(f"W&B cleanup also failed: {cleanup_error}")
+        raise
+    _finish_wandb(logger, exit_code=0)
     return last_checkpoint
 
 
@@ -220,12 +225,22 @@ def _build_module(cfg: DictConfig) -> VideoMAEPretrainingModule:
     model_config = OmegaConf.to_container(cfg.model, resolve=True, throw_on_missing=True)
     if not isinstance(model_config, dict):
         raise TypeError("model config must resolve to a mapping")
+    warmup_epochs = int(cfg.train.warmup_epochs)
+    epochs = int(cfg.train.epochs)
+    if not 0 <= warmup_epochs <= epochs:
+        raise ValueError(f"warmup_epochs must be between 0 and epochs ({epochs})")
     return VideoMAEPretrainingModule(
         model_config,
         lr=float(cfg.train.lr),
         weight_decay=float(cfg.train.weight_decay),
+        warmup_epochs=warmup_epochs,
         seed=int(cfg.seed),
     )
+
+
+def _finish_wandb(logger: Logger | bool, *, exit_code: int) -> None:
+    if logger is not False:
+        logger.experiment.finish(exit_code=exit_code)
 
 
 @hydra.main(version_base=None, config_path="../../../configs", config_name="config")

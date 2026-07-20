@@ -120,11 +120,37 @@ def test_manifest_rejects_video_leakage(tmp_path: Path):
 
 
 def test_manifest_checksum_is_order_independent(tmp_path: Path):
+    (tmp_path / "a.mp4").touch()
+    (tmp_path / "b.mp4").touch()
     first = _record(tmp_path / "a.mp4", record_id="a", split="train")
     second = _record(tmp_path / "b.mp4", record_id="b", split="val")
     assert manifest_checksum(_manifest(first, second)) == manifest_checksum(
         _manifest(second, first)
     )
+
+
+def test_manifest_checksum_is_portable_across_data_roots(tmp_path: Path) -> None:
+    first_root = tmp_path / "machine-a"
+    second_root = tmp_path / "machine-b"
+    first_root.mkdir()
+    second_root.mkdir()
+    (first_root / "clip.mp4").touch()
+    (second_root / "clip.mp4").touch()
+    first = VideoRecord("clip", "demo", first_root / "clip.mp4", "train", "demo", 25.0, 8)
+    second = replace(first, video_path=second_root / "clip.mp4")
+
+    assert manifest_checksum(_manifest(first)) == manifest_checksum(_manifest(second))
+
+
+def test_manifest_checksum_changes_with_video_content(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"first")
+    record = VideoRecord("clip", "demo", video, "train", "demo", 25.0, 8)
+    first = manifest_checksum(_manifest(record))
+
+    video.write_bytes(b"second")
+
+    assert manifest_checksum(_manifest(record)) != first
 
 
 @pytest.mark.parametrize(

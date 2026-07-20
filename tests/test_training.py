@@ -31,6 +31,7 @@ from marineworld.train.experiment import (
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.train.pretrain import (
     _build_decoder,
+    _build_module,
     _prepare_manifest,
     build_dataloaders,
     run_pretraining,
@@ -104,6 +105,12 @@ def _fvessel_manifest(root: Path, *, videos: int = 8) -> tuple[FVesselAdapter, D
     return adapter, adapter.build_manifest(root)
 
 
+def _write_reference_checkpoint(root: Path) -> None:
+    root.mkdir(parents=True)
+    (root / "config.json").write_text('{"model_type":"videomae"}')
+    (root / "model.safetensors").write_bytes(b"weights")
+
+
 class _FakeTrainer:
     def __init__(self, checkpoint: object, *, fail: bool) -> None:
         self.checkpoint = checkpoint
@@ -146,6 +153,115 @@ def test_resolved_config_keeps_non_secret_tokenizer_settings() -> None:
     cfg = OmegaConf.create({"model": {"tokenizer": "videomae"}})
 
     assert resolved_config(cfg) == {"model": {"tokenizer": "videomae"}}
+
+
+def test_resolved_config_omits_operational_paths() -> None:
+    cfg = _compose_config()
+    cfg.data.root = "/private/datasets/fvessel"
+    cfg.output_dir = "/private/outputs/run"
+    cfg.runtime.ckpt_path = "/private/checkpoints/last.ckpt"
+
+    serialized = json.dumps(resolved_config(cfg))
+
+    assert "/private" not in serialized
+    assert "output_dir" not in serialized
+    assert "ckpt_path" not in serialized
+
+
+def test_resolved_config_keeps_scientific_runtime_settings() -> None:
+    cfg = _compose_config("runtime=real_smoke")
+
+    runtime = resolved_config(cfg)["runtime"]
+
+    assert runtime == {
+        "precision": "32-true",
+        "batch_size": 1,
+        "accumulate_grad_batches": 1,
+        "max_steps": 2,
+        "limit_train_batches": 2,
+        "limit_val_batches": 1,
+    }
+    assert "accelerator" not in runtime
+    assert "devices" not in runtime
+    assert "num_workers" not in runtime
+
+
+def test_reference_checkpoint_uses_portable_content_identity(tmp_path: Path) -> None:
+    first = tmp_path / "machine-a" / "reference.ckpt"
+    second = tmp_path / "machine-b" / "renamed.ckpt"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_bytes(b"same checkpoint")
+    second.write_bytes(b"same checkpoint")
+    first_cfg = OmegaConf.create({"model": {"reference_checkpoint": str(first)}})
+    second_cfg = OmegaConf.create({"model": {"reference_checkpoint": str(second)}})
+
+    first_resolved = resolved_config(first_cfg)
+    second_resolved = resolved_config(second_cfg)
+    first_identity = build_run_identity(
+        "videomae", ("manifest",), 42, None, scientific_config=first_resolved
+    )
+    second_identity = build_run_identity(
+        "videomae", ("manifest",), 42, None, scientific_config=second_resolved
+    )
+
+    assert first_resolved == second_resolved
+    assert first_identity.condition_id == second_identity.condition_id
+    assert str(tmp_path) not in json.dumps(first_resolved)
+
+
+def test_reference_checkpoint_content_changes_condition(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "reference.ckpt"
+    cfg = OmegaConf.create({"model": {"reference_checkpoint": str(checkpoint)}})
+    checkpoint.write_bytes(b"first checkpoint")
+    first = resolved_config(cfg)
+
+    checkpoint.write_bytes(b"different checkpoint")
+    second = resolved_config(cfg)
+
+    assert first != second
+
+
+def test_reference_checkpoint_directory_uses_portable_content_identity(tmp_path: Path) -> None:
+    first = tmp_path / "machine-a" / "saved-model"
+    second = tmp_path / "machine-b" / "renamed-model"
+    for checkpoint in (first, second):
+        _write_reference_checkpoint(checkpoint)
+
+    first_resolved = resolved_config(
+        OmegaConf.create({"model": {"reference_checkpoint": str(first)}})
+    )
+    second_resolved = resolved_config(
+        OmegaConf.create({"model": {"reference_checkpoint": str(second)}})
+    )
+    first_identity = build_run_identity(
+        "videomae", ("manifest",), 42, None, scientific_config=first_resolved
+    )
+    second_identity = build_run_identity(
+        "videomae", ("manifest",), 42, None, scientific_config=second_resolved
+    )
+
+    assert first_resolved == second_resolved
+    assert first_identity.condition_id == second_identity.condition_id
+    assert str(tmp_path) not in json.dumps(first_resolved)
+
+
+@pytest.mark.parametrize(
+    ("filename", "replacement"),
+    [("config.json", b'{"model_type":"changed"}'), ("model.safetensors", b"new weights")],
+)
+def test_reference_checkpoint_directory_content_changes_condition(
+    tmp_path: Path, filename: str, replacement: bytes
+) -> None:
+    checkpoint = tmp_path / "saved-model"
+    _write_reference_checkpoint(checkpoint)
+    cfg = OmegaConf.create({"model": {"reference_checkpoint": str(checkpoint)}})
+    first = resolved_config(cfg)
+
+    (checkpoint / filename).write_bytes(replacement)
+    second = resolved_config(cfg)
+
+    assert first != second
 
 
 def test_importing_experiment_does_not_mutate_environment() -> None:
@@ -199,8 +315,10 @@ def test_run_identity_is_stable_across_manifest_order() -> None:
     identity = build_run_identity("videomae", ("sha-a", "sha-b"), seed=42, label_fraction=None)
 
     assert (
-        identity.run_id
-        == build_run_identity("videomae", ("sha-b", "sha-a"), seed=42, label_fraction=None).run_id
+        identity.condition_id
+        == build_run_identity(
+            "videomae", ("sha-b", "sha-a"), seed=42, label_fraction=None
+        ).condition_id
     )
     assert metric_name("probe", "macro_f1", "fvessel") == "probe/fvessel/macro_f1"
 
@@ -213,8 +331,42 @@ def test_run_identity_keeps_execution_metadata_out_of_run_id() -> None:
         "videomae", ("manifest",), seed=42, label_fraction=0.1, git_sha="second", accelerator="a100"
     )
 
-    assert first.run_id == second.run_id
+    assert first.condition_id == second.condition_id
+    assert first.run_id != second.run_id
     assert {"git:first", "accelerator:l4"} <= set(first.tags)
+
+
+def test_run_identity_changes_with_scientific_configuration() -> None:
+    baseline = build_run_identity(
+        "videomae",
+        ("manifest",),
+        seed=42,
+        label_fraction=None,
+        scientific_config={"model": {"mask_ratio": 0.9}, "train": {"lr": 1e-4}},
+    )
+    changed = build_run_identity(
+        "videomae",
+        ("manifest",),
+        seed=42,
+        label_fraction=None,
+        scientific_config={"model": {"mask_ratio": 0.75}, "train": {"lr": 1e-4}},
+    )
+
+    assert baseline.condition_id != changed.condition_id
+    assert f"condition:{baseline.condition_id}" in baseline.tags
+
+
+def test_run_identity_does_not_log_checkpoint_paths() -> None:
+    identity = build_run_identity(
+        "videomae",
+        ("manifest",),
+        seed=42,
+        label_fraction=None,
+        checkpoint_provenance="/private/checkpoints/last.ckpt",
+    )
+
+    assert "checkpoint:last.ckpt" in identity.tags
+    assert "/private" not in json.dumps(identity.tags)
 
 
 def test_metric_name_omits_dataset_for_non_probe_stages() -> None:
@@ -253,6 +405,7 @@ def test_wandb_logger_configuration_is_offline_safe(
     assert captured["offline"] is (mode == "offline")
     assert captured["log_model"] == expected_log_model
     assert captured["id"] == "stable-run"
+    assert captured["resume"] == "never"
     assert "WANDB_API_KEY" not in json.dumps(captured["config"])
 
 
@@ -461,13 +614,13 @@ def test_run_pretraining_finishes_wandb_before_starting_another_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     active = False
-    finishes = 0
+    exit_codes: list[int] = []
     failures = iter((False, True))
 
-    def _finish() -> None:
-        nonlocal active, finishes
+    def _finish(*, exit_code: int) -> None:
+        nonlocal active
         active = False
-        finishes += 1
+        exit_codes.append(exit_code)
 
     def _logger_factory(*_: object) -> object:
         nonlocal active
@@ -492,7 +645,30 @@ def test_run_pretraining_finishes_wandb_before_starting_another_run(
         run_pretraining(_smoke_config(tmp_path / "failure", max_steps=2))
 
     assert not active
-    assert finishes == 2
+    assert exit_codes == [0, 1]
+
+
+def test_wandb_cleanup_does_not_mask_training_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    logger = SimpleNamespace(
+        experiment=SimpleNamespace(
+            finish=lambda **_: (_ for _ in ()).throw(RuntimeError("cleanup failure"))
+        )
+    )
+
+    def _trainer_factory(
+        _cfg: DictConfig, *, logger: object, callbacks: list[object]
+    ) -> _FakeTrainer:
+        del logger
+        return _FakeTrainer(callbacks[0], fail=True)
+
+    monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: logger)
+    monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
+    monkeypatch.setattr("marineworld.train.pretrain._build_module", lambda _: object())
+
+    with pytest.raises(RuntimeError, match="forced trainer failure"):
+        run_pretraining(_smoke_config(tmp_path, max_steps=2))
 
 
 def test_local_smoke_saves_best_and_last_then_resumes(tmp_path: Path) -> None:
@@ -642,3 +818,42 @@ def test_tiny_pretraining_step_updates_parameters(tiny_batch: dict[str, torch.Te
     trainer.fit(module, train_dataloaders=DataLoader([tiny_batch], batch_size=None))
 
     assert not torch.equal(before, next(module.parameters()).detach())
+
+
+def test_warmup_epochs_linearly_increase_learning_rate() -> None:
+    module = VideoMAEPretrainingModule(
+        _tiny_model_config(), lr=1e-3, weight_decay=0.0, warmup_epochs=2
+    )
+
+    configured = module.configure_optimizers()
+    optimizer = configured["optimizer"]
+    scheduler = configured["lr_scheduler"]["scheduler"]
+    rates = [optimizer.param_groups[0]["lr"]]
+    for _ in range(2):
+        optimizer.step()
+        scheduler.step()
+        rates.append(optimizer.param_groups[0]["lr"])
+
+    assert rates == pytest.approx([0.0005, 0.00075, 0.001])
+
+
+def test_pretraining_module_receives_configured_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _compose_config("model=videomae_tiny")
+    captured: dict[str, object] = {}
+
+    def _module_factory(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("marineworld.train.pretrain.VideoMAEPretrainingModule", _module_factory)
+    _build_module(cfg)
+
+    assert captured["warmup_epochs"] == cfg.train.warmup_epochs
+
+
+@pytest.mark.parametrize("warmup_epochs", [-1, 101])
+def test_pretraining_module_rejects_invalid_warmup(warmup_epochs: int) -> None:
+    cfg = _compose_config("model=videomae_tiny", f"train.warmup_epochs={warmup_epochs}")
+
+    with pytest.raises(ValueError, match="warmup_epochs"):
+        _build_module(cfg)

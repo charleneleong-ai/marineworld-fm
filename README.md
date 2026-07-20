@@ -104,8 +104,16 @@ mise run smoke
 ```
 
 The smoke covers manifest construction, synthetic decoding, training, validation, and
-best/last checkpoint creation under `outputs/`. To launch the same entrypoint on a single
-GPU, provide the real FVessel root explicitly; both cloud profiles use online W&B logging:
+best/last checkpoint creation under `outputs/`. The bounded real-data smoke uses two
+training steps and one validation batch with online W&B logging:
+
+```bash
+MARINEWORLD_DATA_ROOT=/path/to/fvessel mise run smoke:fvessel
+```
+
+This path was verified on an A100 80 GB against the official FVessel Clip-10 data in
+[W&B run `9f96061c77293b81`](https://wandb.ai/chaleong/marineworld-fm/runs/9f96061c77293b81).
+For longer single-GPU runs, provide the same FVessel root explicitly:
 
 ```bash
 MARINEWORLD_DATA_ROOT=/path/to/fvessel mise run train:l4

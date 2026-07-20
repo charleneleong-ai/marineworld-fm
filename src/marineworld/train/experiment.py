@@ -4,32 +4,52 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from omegaconf import DictConfig, OmegaConf
+
+from marineworld.data.manifest import directory_checksum, file_checksum
 
 if TYPE_CHECKING:
     from pytorch_lightning.loggers import WandbLogger
 
 
-_SECRET_KEY_SUFFIXES = ("apikey", "password", "secret", "token")
+SECRET_KEY_SUFFIXES = ("apikey", "password", "secret", "token")
+SCIENTIFIC_CONFIG_SECTIONS = ("seed", "data", "model", "train")
+SCIENTIFIC_RUNTIME_KEYS = (
+    "precision",
+    "batch_size",
+    "accumulate_grad_batches",
+    "max_steps",
+    "limit_train_batches",
+    "limit_val_batches",
+)
+OPERATIONAL_CONFIG_KEYS = frozenset({"root"})
 
 
 @dataclass(frozen=True)
 class RunIdentity:
-    """The deterministic W&B identity for one logical experiment."""
+    """A unique execution attempt linked to a reproducible scientific condition."""
 
     run_id: str
     group: str
     tags: tuple[str, ...]
+    condition_id: str = ""
 
 
 def resolved_config(cfg: DictConfig) -> dict[str, Any]:
-    """Resolve a Hydra config into primitive, credential-free values."""
+    """Return allowlisted scientific settings safe for experiment logging."""
     resolved = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     assert isinstance(resolved, dict)
-    return _without_secrets(resolved)
+    scientific = {key: resolved[key] for key in SCIENTIFIC_CONFIG_SECTIONS if key in resolved}
+    if isinstance(runtime := resolved.get("runtime"), dict):
+        scientific["runtime"] = {
+            key: runtime[key] for key in SCIENTIFIC_RUNTIME_KEYS if key in runtime
+        }
+    return _redact_config(scientific)
 
 
 def build_run_identity(
@@ -41,17 +61,20 @@ def build_run_identity(
     git_sha: str | None = None,
     accelerator: str | None = None,
     checkpoint_provenance: str | None = None,
+    scientific_config: dict[str, Any] | None = None,
 ) -> RunIdentity:
-    """Build a run ID independent of source revision and execution hardware."""
+    """Build a portable condition fingerprint and a unique execution attempt ID."""
     condition = {
         "label_fraction": label_fraction,
         "manifest_checksums": sorted(manifest_checksums),
         "model": model,
         "seed": seed,
+        "scientific_config": scientific_config or {},
     }
     payload = json.dumps(condition, sort_keys=True, separators=(",", ":"))
-    run_id = hashlib.sha256(payload.encode()).hexdigest()[:16]
-    tags = [f"model:{model}", f"seed:{seed}"]
+    condition_id = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    run_id = secrets.token_hex(8)
+    tags = [f"condition:{condition_id}", f"model:{model}", f"seed:{seed}"]
     if label_fraction is not None:
         tags.append(f"label_fraction:{label_fraction:g}")
     for name, value in (
@@ -60,8 +83,15 @@ def build_run_identity(
         ("checkpoint", checkpoint_provenance),
     ):
         if value:
+            if name == "checkpoint":
+                value = Path(value).name
             tags.append(f"{name}:{value}")
-    return RunIdentity(run_id=run_id, group=model, tags=tuple(tags))
+    return RunIdentity(
+        run_id=run_id,
+        group=condition_id,
+        tags=tuple(tags),
+        condition_id=condition_id,
+    )
 
 
 def build_wandb_logger(cfg: DictConfig, identity: RunIdentity) -> WandbLogger | Literal[False]:
@@ -75,6 +105,7 @@ def build_wandb_logger(cfg: DictConfig, identity: RunIdentity) -> WandbLogger | 
         project=cfg.tracking.project,
         entity=cfg.tracking.entity,
         id=identity.run_id,
+        resume="never",
         group=identity.group,
         tags=list(identity.tags),
         offline=mode == "offline",
@@ -95,19 +126,38 @@ def _create_wandb_logger(**kwargs: Any) -> WandbLogger:
     return WandbLogger(**kwargs)
 
 
-def _without_secrets(value: Any) -> Any:
+def _redact_config(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: _without_secrets(item) for key, item in value.items() if not _is_secret_key(key)
+            key: (_checkpoint_identity(item) if _is_checkpoint_key(key) else _redact_config(item))
+            for key, item in value.items()
+            if not _is_secret_key(key) and key not in OPERATIONAL_CONFIG_KEYS
         }
     if isinstance(value, list):
-        return [_without_secrets(item) for item in value]
+        return [_redact_config(item) for item in value]
     return value
+
+
+def _checkpoint_identity(value: Any) -> Any:
+    if not isinstance(value, str):
+        return _redact_config(value)
+    path = Path(value).expanduser()
+    if path.is_file():
+        return f"sha256:{file_checksum(path)}"
+    if path.is_dir():
+        return f"sha256-directory:{directory_checksum(path)}"
+    if path.is_absolute() or value.startswith("~"):
+        return f"unavailable:{path.name}"
+    return value
+
+
+def _is_checkpoint_key(key: object) -> bool:
+    return _normalize_key(key).endswith("checkpoint")
 
 
 def _is_secret_key(key: object) -> bool:
     normalized = _normalize_key(key)
-    return normalized.endswith(_SECRET_KEY_SUFFIXES)
+    return normalized.endswith(SECRET_KEY_SUFFIXES)
 
 
 def _normalize_key(key: object) -> str:
