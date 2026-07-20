@@ -29,6 +29,9 @@ train = [
     "hydra-core>=1.3",
     "omegaconf>=2.3",
     "decord>=0.6; sys_platform != 'darwin'",  # no macOS distribution
+    "av>=18,<19",
+    "httpx>=0.27",
+    "typer>=0.16,<1",
     "wandb>=0.17",
     "motmetrics>=1.4",             # tracking eval (MOTA/IDF1)
     "scikit-learn>=1.5",

@@ -3,26 +3,32 @@
 from __future__ import annotations
 
 import sys
+import zipfile
 from dataclasses import replace
 from pathlib import Path
+from typing import NoReturn
 
 import numpy as np
 import pytest
 import torch
 import yaml
 
+from marineworld.data import video
 from marineworld.data.adapters import DatasetAdapter, build_adapter
 from marineworld.data.clips import (
+    AutoVideoDecoder,
     DecordVideoDecoder,
     MaritimeClipDataset,
     SyntheticVideoDecoder,
     build_clip_index,
 )
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
+from marineworld.data.download import safe_extract_zip
 from marineworld.data.fvessel import FVesselAdapter
 from marineworld.data.manifest import manifest_checksum, validate_manifest
 from marineworld.data.smd import SMDAdapter
 from marineworld.data.synthetic import SyntheticAdapter
+from marineworld.data.video import VideoBackendUnavailable, VideoMetadata, probe_video
 
 
 def _record(video: Path, *, record_id: str, split: str) -> VideoRecord:
@@ -63,6 +69,10 @@ def _fps_nan(_: Path) -> float:
     return float("nan")
 
 
+def _backend_unavailable(*_args: object) -> NoReturn:
+    raise VideoBackendUnavailable("unavailable")
+
+
 def _target(frame_index: int) -> FrameTargets:
     return FrameTargets(
         frame_index=frame_index,
@@ -84,7 +94,7 @@ def _fvessel_adapter(tmp_path: Path) -> tuple[DatasetAdapter, Path]:
     (sample / "ais").mkdir()
     (sample / "sample.mp4").touch()
     (sample / "gt" / "gt.txt").write_text("1,7,10,20,30,40,1,1,1\n")
-    return FVesselAdapter(version="fixture", fps=30.0), root
+    return FVesselAdapter(version="fixture", fps=30.0, num_frames=16), root
 
 
 def _smd_adapter(tmp_path: Path) -> tuple[DatasetAdapter, Path]:
@@ -183,7 +193,7 @@ def test_fvessel_parses_mot_targets(tmp_path: Path) -> None:
 
 def test_fvessel_probes_fps_when_not_explicit(tmp_path: Path) -> None:
     _, root = _fvessel_adapter(tmp_path)
-    adapter = FVesselAdapter(version="fixture", fps=None, fps_probe=_fps_25)
+    adapter = FVesselAdapter(version="fixture", fps=None, num_frames=16, fps_probe=_fps_25)
 
     record = adapter.build_manifest(root).records[0]
 
@@ -192,7 +202,7 @@ def test_fvessel_probes_fps_when_not_explicit(tmp_path: Path) -> None:
 
 def test_fvessel_explicit_fps_bypasses_probe(tmp_path: Path) -> None:
     _, root = _fvessel_adapter(tmp_path)
-    adapter = FVesselAdapter(version="fixture", fps=20.0, fps_probe=_never_probe)
+    adapter = FVesselAdapter(version="fixture", fps=20.0, num_frames=16, fps_probe=_never_probe)
 
     record = adapter.build_manifest(root).records[0]
 
@@ -201,20 +211,10 @@ def test_fvessel_explicit_fps_bypasses_probe(tmp_path: Path) -> None:
 
 def test_fvessel_rejects_invalid_probed_fps(tmp_path: Path) -> None:
     _, root = _fvessel_adapter(tmp_path)
-    adapter = FVesselAdapter(version="fixture", fps=None, fps_probe=_fps_nan)
+    adapter = FVesselAdapter(version="fixture", fps=None, num_frames=16, fps_probe=_fps_nan)
 
     with pytest.raises(ValueError, match="FPS must be positive"):
         adapter.build_manifest(root)
-
-
-def test_fvessel_default_probe_reports_missing_decord(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _, root = _fvessel_adapter(tmp_path)
-    monkeypatch.setitem(sys.modules, "decord", None)
-
-    with pytest.raises(RuntimeError, match="supported platform or configure a positive fps"):
-        FVesselAdapter(version="fixture").build_manifest(root)
 
 
 def test_build_adapter_instantiates_configured_target() -> None:
@@ -319,6 +319,93 @@ def test_decord_decoder_missing_dependency_explains_supported_fallback(
 
     with pytest.raises(RuntimeError, match="supported platform or inject another VideoDecoder"):
         DecordVideoDecoder().decode(record, (0,))
+
+
+def test_auto_decoder_prefers_decord(
+    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
+    monkeypatch.setattr(video, "_decord_decode", lambda *_: calls.append("decord") or frames)
+    monkeypatch.setattr(video, "_pyav_decode", lambda *_: calls.append("pyav") or frames)
+
+    AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+    assert calls == ["decord"]
+
+
+def test_auto_decoder_falls_back_to_pyav(
+    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames = torch.tensor([2, 0, 2], dtype=torch.uint8).view(3, 1, 1, 1).expand(-1, 3, 2, 2)
+    monkeypatch.setattr(video, "_decord_decode", _backend_unavailable)
+    monkeypatch.setattr(video, "_pyav_decode", lambda *_: frames)
+
+    decoded = AutoVideoDecoder().decode(synthetic_manifest.records[0], (2, 0, 2))
+
+    assert decoded[:, 0, 0, 0].tolist() == [2, 0, 2]
+
+
+def test_auto_decoder_names_both_missing_backends(
+    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(video, "_decord_decode", _backend_unavailable)
+    monkeypatch.setattr(video, "_pyav_decode", _backend_unavailable)
+
+    with pytest.raises(RuntimeError, match="decord.*PyAV"):
+        AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+
+def test_video_probe_prefers_decord(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+    expected = VideoMetadata(frame_count=12, fps=25.0)
+    monkeypatch.setattr(video, "_decord_probe", lambda *_: calls.append("decord") or expected)
+    monkeypatch.setattr(video, "_pyav_probe", lambda *_: calls.append("pyav") or expected)
+
+    assert probe_video(tmp_path / "clip.mp4") == expected
+    assert calls == ["decord"]
+
+
+def test_video_probe_falls_back_to_pyav(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    expected = VideoMetadata(frame_count=12, fps=25.0)
+    monkeypatch.setattr(video, "_decord_probe", _backend_unavailable)
+    monkeypatch.setattr(video, "_pyav_probe", lambda *_: expected)
+
+    assert probe_video(tmp_path / "clip.mp4") == expected
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [VideoMetadata(frame_count=0, fps=25.0), VideoMetadata(frame_count=12, fps=0.0)],
+)
+def test_video_probe_rejects_non_positive_metadata(
+    metadata: VideoMetadata, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(video, "_decord_probe", lambda *_: metadata)
+
+    with pytest.raises(ValueError, match="positive"):
+        probe_video(tmp_path / "private" / "clip.mp4")
+
+
+@pytest.mark.parametrize("member", ["../escape.txt", "/absolute.txt", "nested/../../escape.txt"])
+def test_safe_extract_zip_rejects_members_outside_destination(tmp_path: Path, member: str) -> None:
+    archive = tmp_path / "archive.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr(member, "unsafe")
+
+    with pytest.raises(ValueError, match="unsafe archive member"):
+        safe_extract_zip(archive, tmp_path / "data")
+
+
+def test_safe_extract_zip_preserves_nested_files(tmp_path: Path) -> None:
+    archive = tmp_path / "archive.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("sample/video.mp4", "video")
+
+    destination = tmp_path / "data"
+    safe_extract_zip(archive, destination)
+
+    assert (destination / "sample" / "video.mp4").read_text() == "video"
 
 
 def test_clip_dataset_caches_and_filters_adapter_targets(

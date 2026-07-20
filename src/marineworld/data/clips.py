@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 from marineworld.data.manifest import manifest_checksum, validate_manifest
+from marineworld.data.video import decode_video
 
 Split = Literal["train", "val", "test"]
 TargetLoader = Callable[[VideoRecord], tuple[FrameTargets, ...]]
@@ -51,6 +52,13 @@ class DecordVideoDecoder:
         except Exception as error:
             raise RuntimeError(f"could not decode frames from {record.video_path}") from error
         return torch.from_numpy(frames).permute(0, 3, 1, 2)
+
+
+class AutoVideoDecoder:
+    """Decode frames with the first available supported backend."""
+
+    def decode(self, record: VideoRecord, frame_indices: Sequence[int]) -> torch.Tensor:
+        return decode_video(record, tuple(frame_indices))
 
 
 @dataclass(frozen=True)
