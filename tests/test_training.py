@@ -291,6 +291,16 @@ def test_local_smoke_profile_uses_cpu() -> None:
     assert cfg.runtime.accelerator == "cpu"
 
 
+def test_real_smoke_profile_is_bounded_and_online() -> None:
+    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=real_smoke")
+
+    assert cfg.runtime.max_steps == 2
+    assert cfg.runtime.limit_train_batches == 2
+    assert cfg.runtime.limit_val_batches == 1
+    assert cfg.runtime.num_workers == 0
+    assert cfg.runtime.tracking_mode == "online"
+
+
 def test_real_data_uses_portable_video_decoder() -> None:
     cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
 
