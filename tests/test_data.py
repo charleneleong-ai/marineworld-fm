@@ -12,7 +12,9 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from typer.testing import CliRunner
 
+from marineworld.data import download as download_module
 from marineworld.data import video
 from marineworld.data.adapters import DatasetAdapter, build_adapter
 from marineworld.data.clips import (
@@ -23,6 +25,7 @@ from marineworld.data.clips import (
     build_clip_index,
 )
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
+from marineworld.data.download import app as download_app
 from marineworld.data.download import safe_extract_zip
 from marineworld.data.fvessel import FVesselAdapter
 from marineworld.data.manifest import manifest_checksum, validate_manifest
@@ -406,6 +409,17 @@ def test_safe_extract_zip_preserves_nested_files(tmp_path: Path) -> None:
     safe_extract_zip(archive, destination)
 
     assert (destination / "sample" / "video.mp4").read_text() == "video"
+
+
+def test_fvessel_downloader_exposes_named_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(download_module, "download_fvessel_clip10", lambda output: output)
+    result = CliRunner().invoke(
+        download_app, ["fvessel-clip10", "--output", str(tmp_path / "fvessel")]
+    )
+
+    assert result.exit_code == 0
 
 
 def test_clip_dataset_caches_and_filters_adapter_targets(
