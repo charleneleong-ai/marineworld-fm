@@ -306,7 +306,7 @@ git commit -m "feat: log wandb reconstruction previews"
 **Interfaces:**
 - Verifies the complete media-logging feature; introduces no new public Python interface.
 
-- [ ] **Step 1: Document W&B media behaviour and privacy**
+- [x] **Step 1: Document W&B media behaviour and privacy**
 
 Add a concise README section showing:
 
@@ -319,7 +319,7 @@ tracking:
 
 Document the four media keys, the best-checkpoint semantics, bounded cadence, and the explicit warning that online SMD/FVessel runs upload sampled raw frames and derived previews. Include `tracking.log_media=false` as the opt-out command.
 
-- [ ] **Step 2: Run complete local verification**
+- [x] **Step 2: Run complete local verification**
 
 Run:
 
@@ -333,7 +333,7 @@ git diff --check
 
 Expected: every command exits zero; the full test count is at least 255.
 
-- [ ] **Step 3: Verify the online synthetic W&B run**
+- [x] **Step 3: Verify the online synthetic W&B run**
 
 With the user's existing explicit approval for synthetic run metadata and image upload, run the two-step `joint_synthetic` smoke in online mode with isolated checkpoint output. Query the resulting run through `wandb.Api()` and assert:
 
@@ -344,11 +344,13 @@ With the user's existing explicit approval for synthetic run metadata and image 
 - the training-manifest and model artifacts still exist; and
 - no raw SMD/FVessel data was involved in this verification.
 
-- [ ] **Step 4: Final whole-diff review**
+Verified in [W&B run `0f854e141fbacc0a`](https://wandb.ai/chaleong/marineworld-fm/runs/0f854e141fbacc0a): state `finished`, validation loss `0.99274`, exactly four synthetic media files under the four configured keys, one dataset-manifest artifact, and two model artifact versions.
+
+- [x] **Step 4: Final whole-diff review**
 
 Review `origin/main...HEAD` with emphasis on raw-data upload clarity, W&B logger lifecycle, rank/interval gates, checkpoint isolation, tensor-to-image correctness, memory bounds, and regression coverage. Fix every accepted Critical/Important finding before continuing.
 
-- [ ] **Step 5: Commit documentation and push the reviewed branch**
+- [x] **Step 5: Commit documentation and push the reviewed branch**
 
 Pure documentation may skip simplify; hook-check it before commit:
 
