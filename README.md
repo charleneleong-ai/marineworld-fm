@@ -119,6 +119,31 @@ Each training run writes a path-free `training_manifest.json` and logs it as a W
 dataset artifact. It records exact split membership, component checksums, licence
 and access metadata without uploading raw frames or restricted mount paths.
 
+### W&B media previews
+
+W&B-backed pretraining enables bounded visual previews by default:
+
+```yaml
+tracking:
+  log_media: true
+  media_log_every_n_epochs: 1
+  media_max_frames: 4
+```
+
+The first validation batch at each configured epoch interval logs one video under
+`media/validation_inputs` and `media/validation_reconstruction`, with at most four
+evenly spaced frames. After training, the callback restores the checkpoint selected
+as best by Lightning and logs the same retained validation sample under
+`media/best_inputs` and `media/best_reconstruction`; it does not use the final
+in-memory weights. Logging is rank-zero-only and bounded to one video, up to
+`media_max_frames` frames, and one event per configured epoch interval.
+
+> **Raw-frame upload warning:** online SMD and FVessel runs upload sampled raw video
+> frames and derived masked-reconstruction previews to W&B when media logging is
+> enabled. The path-free manifest artifact does not contain raw media, but these
+> image previews do. Confirm that the dataset terms and W&B project access permit
+> this upload, or opt out explicitly with `tracking.log_media=false`.
+
 The L4 and A100 profiles share the data, model, optimization schedule, and trainer behavior.
 They differ only in precision, batch size, gradient accumulation, and data-loader workers.
 
