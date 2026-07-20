@@ -31,6 +31,7 @@ from marineworld.train.experiment import (
     metric_name,
     resolved_config,
 )
+from marineworld.train.media import build_media_preview
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.train.pretrain import (
     BalancedDatasetSampler,
@@ -63,6 +64,206 @@ def _tiny_model_config() -> dict[str, int | float | str]:
         "mask_ratio": 0.5,
         "seed": 42,
     }
+
+
+def test_build_media_preview_denormalizes_and_bounds_output() -> None:
+    pixels = torch.linspace(-2, 2, steps=24).reshape(1, 2, 3, 2, 2)
+    mask = torch.tensor([[True, False, True, False, True, False, True, False]])
+    logits = torch.zeros(1, 4, 3)
+
+    preview = build_media_preview(
+        pixel_values=pixels,
+        bool_masked_pos=mask,
+        logits=logits,
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+        patch_size=(1, 1),
+        tubelet_size=1,
+        max_frames=2,
+        dataset="synthetic",
+        source="generated",
+    )
+
+    assert preview.input_grid.shape == (2, 4, 3)
+    assert preview.reconstruction_panel.shape == (4, 8, 3)
+    assert preview.input_grid.min() >= 0
+    assert preview.input_grid.max() <= 1
+    assert preview.caption == "dataset=synthetic source=generated"
+
+
+def test_build_media_preview_places_decoder_patches_and_expands_tube_masks() -> None:
+    pixels = torch.full((1, 2, 3, 2, 2), 0.1)
+    mask = torch.tensor([[True, False, False, True, False, False, False, False]])
+    logits = torch.tensor([[[0.2, 0.2, 0.2], [0.8, 0.8, 0.8]]])
+
+    preview = build_media_preview(
+        pixel_values=pixels,
+        bool_masked_pos=mask,
+        logits=logits,
+        mean=(0.0, 0.0, 0.0),
+        std=(1.0, 1.0, 1.0),
+        patch_size=(1, 1),
+        tubelet_size=1,
+        max_frames=2,
+        dataset="synthetic",
+        source="generated",
+        norm_pix_loss=False,
+    )
+
+    panel = preview.reconstruction_panel
+    assert panel[0, 0, 0] == pytest.approx(0.1)  # Original, frame 0, patch 0.
+    assert panel[0, 2, 0] == pytest.approx(0.5)  # Expanded mask is gray.
+    assert panel[0, 4, 0] == pytest.approx(0.2)  # First decoder patch.
+    assert panel[0, 6, 0] == pytest.approx(0.1)  # Absolute error heatmap.
+    assert panel[1, 5, 0] == pytest.approx(0.8)  # Non-adjacent decoder patch.
+    assert panel[1, 7, 0] == pytest.approx(0.7)  # Its error heatmap.
+    assert panel[2, 4, 0] == pytest.approx(0.1)  # Visible frame 1 patch is preserved.
+
+
+def test_build_media_preview_places_decoder_patches_after_input_denormalization() -> None:
+    pixels = torch.full((1, 1, 3, 2, 2), -0.5)
+    mask = torch.tensor([[True, False, False, False]])
+    logits = torch.full((1, 1, 3), 0.8)
+
+    preview = build_media_preview(
+        pixel_values=pixels,
+        bool_masked_pos=mask,
+        logits=logits,
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+        patch_size=(1, 1),
+        tubelet_size=1,
+        max_frames=1,
+        dataset="synthetic",
+        source="generated",
+        norm_pix_loss=False,
+    )
+
+    panel = preview.reconstruction_panel
+    assert panel[0, 0, 0] == pytest.approx(0.25)
+    assert panel[0, 4, 0] == pytest.approx(0.8)
+    assert panel[0, 6, 0] == pytest.approx(0.55)
+
+
+def test_build_media_preview_unnormalizes_patch_normalized_decoder_logits() -> None:
+    pixels = torch.tensor(
+        [[[[[0.1, 0.2], [0.3, 0.4]], [[0.1, 0.2], [0.3, 0.4]], [[0.1, 0.2], [0.3, 0.4]]]]]
+    )
+    mask = torch.tensor([[True]])
+    logits = torch.ones(1, 1, 12)
+
+    preview = build_media_preview(
+        pixel_values=pixels,
+        bool_masked_pos=mask,
+        logits=logits,
+        mean=(0.0, 0.0, 0.0),
+        std=(1.0, 1.0, 1.0),
+        patch_size=(2, 2),
+        tubelet_size=1,
+        max_frames=1,
+        dataset="synthetic",
+        source="generated",
+        norm_pix_loss=True,
+    )
+
+    expected = 0.25 + (1 / 60) ** 0.5 + 1e-6
+    assert preview.reconstruction_panel[0, 4, 0] == pytest.approx(expected)
+    assert preview.reconstruction_panel[0, 6, 0] == pytest.approx(expected - 0.1)
+
+
+@pytest.mark.parametrize(
+    ("pixels", "mask", "logits", "max_frames", "message"),
+    [
+        (
+            torch.zeros(1, 2, 3, 2, 2),
+            torch.zeros(1, 8, dtype=torch.bool),
+            torch.zeros(1, 0, 3),
+            0,
+            "max_frames must be an integer from 1 to 4",
+        ),
+        (
+            torch.zeros(1, 2, 3, 2, 2),
+            torch.zeros(1, 7, dtype=torch.bool),
+            torch.zeros(1, 0, 3),
+            2,
+            "bool_masked_pos length",
+        ),
+        (
+            torch.zeros(1, 2, 3, 2, 2),
+            torch.zeros(1, 8, dtype=torch.bool),
+            torch.zeros(1, 0, 2),
+            2,
+            "decoder patch width",
+        ),
+        (
+            torch.empty(1, 0, 3, 2, 2),
+            torch.zeros(1, 0, dtype=torch.bool),
+            torch.zeros(1, 0, 3),
+            2,
+            "at least one frame",
+        ),
+    ],
+)
+def test_build_media_preview_rejects_invalid_shapes(
+    pixels: torch.Tensor,
+    mask: torch.Tensor,
+    logits: torch.Tensor,
+    max_frames: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_media_preview(
+            pixel_values=pixels,
+            bool_masked_pos=mask,
+            logits=logits,
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+            patch_size=(1, 1),
+            tubelet_size=1,
+            max_frames=max_frames,
+            dataset="synthetic",
+            source="generated",
+        )
+
+
+@pytest.mark.parametrize(
+    ("max_frames", "patch_size", "tubelet_size", "message"),
+    [
+        (5, (1, 1), 1, "max_frames must be an integer from 1 to 4"),
+        (True, (1, 1), 1, "max_frames must be an integer from 1 to 4"),
+        (1.5, (1, 1), 1, "max_frames must be an integer from 1 to 4"),
+        (1, 1, 1, "patch_size must be a two-item sequence"),
+        (1, (1,), 1, "patch_size must be a two-item sequence"),
+        (1, (1, 1, 1), 1, "patch_size must be a two-item sequence"),
+        (1, (0, 1), 1, "patch_size entries must be positive integers"),
+        (1, (-1, 1), 1, "patch_size entries must be positive integers"),
+        (1, (1.0, 1), 1, "patch_size entries must be positive integers"),
+        (1, (True, 1), 1, "patch_size entries must be positive integers"),
+        (1, (1, 1), 0, "tubelet_size must be a positive integer"),
+        (1, (1, 1), -1, "tubelet_size must be a positive integer"),
+        (1, (1, 1), 1.0, "tubelet_size must be a positive integer"),
+        (1, (1, 1), True, "tubelet_size must be a positive integer"),
+    ],
+)
+def test_build_media_preview_rejects_invalid_configuration(
+    max_frames: object,
+    patch_size: object,
+    tubelet_size: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_media_preview(
+            pixel_values=torch.zeros(1, 1, 3, 2, 2),
+            bool_masked_pos=torch.zeros(1, 4, dtype=torch.bool),
+            logits=torch.zeros(1, 0, 3),
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+            patch_size=patch_size,  # type: ignore[arg-type]
+            tubelet_size=tubelet_size,  # type: ignore[arg-type]
+            max_frames=max_frames,  # type: ignore[arg-type]
+            dataset="synthetic",
+            source="generated",
+        )
 
 
 @pytest.fixture
