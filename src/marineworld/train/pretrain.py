@@ -37,6 +37,7 @@ from marineworld.train.experiment import (
     build_wandb_logger,
     resolved_config,
 )
+from marineworld.train.media import WandbMediaCallback
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.utils.seed import seed_everything
 
@@ -273,6 +274,7 @@ def build_trainer(
 
 def run_pretraining(cfg: DictConfig) -> Path:
     """Train from a composed config and return the last checkpoint path."""
+    _validate_media_config(cfg)
     seed_everything(int(cfg.seed))
     adapter = build_data_adapter(cfg.data)
     manifest = _prepare_manifest(cfg, adapter.build_manifest(Path(cfg.data.root)))
@@ -299,9 +301,6 @@ def _training_run_identity(
             )
         },
     }
-    for component in material.get("data", {}).get("components", {}).values():
-        component.pop("root", None)
-    material.get("data", {}).pop("root", None)
     return build_run_identity(
         str(cfg.model.name),
         checksums,
@@ -334,7 +333,15 @@ def _run_with_identity(
         )
         train_loader = dataloaders["train_dataloaders"]
         sampler = train_loader.sampler
-        callbacks: list[Callback] = [checkpoint]
+        media = WandbMediaCallback(
+            mean=tuple(cfg.data.transforms.normalization.mean),
+            std=tuple(cfg.data.transforms.normalization.std),
+            enabled=cfg.tracking.log_media,
+            every_n_epochs=int(cfg.tracking.media_log_every_n_epochs),
+            max_frames=int(cfg.tracking.media_max_frames),
+            checkpoint_callback=checkpoint,
+        )
+        callbacks: list[Callback] = [checkpoint, media]
         if isinstance(sampler, BalancedDatasetSampler):
             callbacks.append(_BalancedSamplerCheckpoint(sampler, int(cfg.runtime.batch_size)))
         trainer = build_trainer(cfg, logger=logger, callbacks=callbacks)
@@ -354,6 +361,25 @@ def _run_with_identity(
     if not last_checkpoint.is_file():
         raise RuntimeError(f"last checkpoint does not exist: {last_checkpoint}")
     return last_checkpoint
+
+
+def _validate_media_config(cfg: DictConfig) -> None:
+    if type(cfg.tracking.log_media) is not bool:
+        raise ValueError("tracking.log_media must be boolean")
+    for key in ("media_log_every_n_epochs", "media_max_frames"):
+        value = cfg.tracking[key]
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            or (key == "media_max_frames" and value > 4)
+        ):
+            constraint = (
+                "positive integer between 1 and 4"
+                if key == "media_max_frames"
+                else "positive integer"
+            )
+            raise ValueError(f"tracking.{key} must be {constraint}")
 
 
 def write_training_manifest(manifest: DatasetManifest, output_dir: Path) -> Path:

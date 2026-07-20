@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
@@ -32,13 +33,14 @@ from marineworld.train.experiment import (
     metric_name,
     resolved_config,
 )
-from marineworld.train.media import build_media_preview
+from marineworld.train.media import WandbMediaCallback, build_media_preview
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.train.pretrain import (
     BalancedDatasetSampler,
     _BalancedSamplerCheckpoint,
     _prepare_manifest,
     _training_run_identity,
+    _validate_media_config,
     build_dataloaders,
     run_pretraining,
     write_training_manifest,
@@ -309,6 +311,459 @@ def _smoke_config(tmp_path: Path, *, max_steps: int) -> DictConfig:
     )
 
 
+class _FakeExperiment:
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict[str, object], int | None]] = []
+        self.explicit_steps: list[int] = []
+        self.history: dict[str, object] = {}
+        self.local_step = 0
+        self.finished = False
+
+    def log(self, payload: dict[str, object], step: int | None = None) -> None:
+        if step is not None:
+            self.explicit_steps.append(step)
+            if step < self.local_step:
+                raise ValueError("non-monotonic explicit W&B step")
+            self.local_step = step
+        self.calls.append((payload, step))
+        self.history.update(payload)
+        self.local_step += 1
+
+    def finish(self) -> None:
+        self.finished = True
+
+
+class WandbLogger:
+    __module__ = "pytorch_lightning.loggers.wandb"
+
+    def __init__(self, experiment: _FakeExperiment) -> None:
+        self.experiment = experiment
+
+    def log_metrics(self, metrics: dict[str, object], step: int | None = None) -> None:
+        payload = dict(metrics)
+        if step is not None:
+            payload["trainer/global_step"] = step
+        self.experiment.log(payload)
+
+
+class _FakeImage:
+    def __init__(self, data: object, caption: str) -> None:
+        self.data = data
+        self.caption = caption
+
+
+def _media_batch() -> dict[str, object]:
+    return {
+        "pixel_values": torch.stack((torch.zeros(4, 3, 16, 16), torch.ones(4, 3, 16, 16))),
+        "dataset": ("synthetic", "other"),
+        "source": ("generated/clip-0", "generated/clip-1"),
+        "record_id": ("clip-0", "clip-1"),
+    }
+
+
+def _media_trainer(logger: object, *, rank: int = 0, epoch: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(
+        logger=logger,
+        global_rank=rank,
+        current_epoch=epoch,
+        global_step=7,
+    )
+
+
+def _media_callback(
+    checkpoint: object, *, enabled: bool = True, every_n_epochs: int = 2
+) -> WandbMediaCallback:
+    return WandbMediaCallback(
+        mean=(0.0, 0.0, 0.0),
+        std=(1.0, 1.0, 1.0),
+        enabled=enabled,
+        every_n_epochs=every_n_epochs,
+        max_frames=2,
+        checkpoint_callback=checkpoint,
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "rank", "epoch", "expected_calls"),
+    [(False, 0, 0, 0), (True, 1, 0, 0), (True, 0, 1, 0), (True, 0, 2, 1)],
+)
+def test_media_callback_gates_validation_logging(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    rank: int,
+    epoch: int,
+    expected_calls: int,
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    experiment = _FakeExperiment()
+    callback = _media_callback(SimpleNamespace(best_model_path=""), enabled=enabled)
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+
+    callback.on_validation_batch_end(
+        _media_trainer(WandbLogger(experiment), rank=rank, epoch=epoch),
+        module,
+        None,
+        _media_batch(),
+        0,
+    )
+
+    assert len(experiment.calls) == expected_calls
+    if expected_calls:
+        payload, step = experiment.calls[0]
+        assert set(payload) == {
+            "media/validation_inputs",
+            "media/validation_reconstruction",
+            "trainer/global_step",
+        }
+        assert step is None
+        assert payload["trainer/global_step"] == 7
+        media = {key: image for key, image in payload.items() if key.startswith("media/")}
+        assert all(isinstance(image, _FakeImage) for image in media.values())
+        assert all(
+            image.caption == "dataset=synthetic source=generated/clip-0" for image in media.values()
+        )
+        assert payload["media/validation_inputs"].data.shape == (16, 32, 3)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "logger"),
+    [
+        (False, WandbLogger(_FakeExperiment())),
+        (True, False),
+        (True, SimpleNamespace(experiment=_FakeExperiment())),
+    ],
+)
+def test_media_callback_skips_inference_and_wandb_import_without_active_wandb(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, logger: object
+) -> None:
+    monkeypatch.delitem(sys.modules, "wandb", raising=False)
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    monkeypatch.setattr(
+        module.model,
+        "forward",
+        lambda **_: pytest.fail("media inference must be gated before model execution"),
+    )
+    callback = _media_callback(SimpleNamespace(best_model_path=""), enabled=enabled)
+
+    callback.on_validation_batch_end(
+        _media_trainer(logger, epoch=2), module, None, _media_batch(), 0
+    )
+
+    assert "wandb" not in sys.modules
+
+
+def test_media_callback_skips_secondary_validation_loaders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    experiment = _FakeExperiment()
+    callback = _media_callback(SimpleNamespace(best_model_path=""))
+
+    callback.on_validation_batch_end(
+        _media_trainer(WandbLogger(experiment), epoch=2),
+        VideoMAEPretrainingModule(_tiny_model_config()),
+        None,
+        _media_batch(),
+        0,
+        dataloader_idx=1,
+    )
+
+    assert experiment.calls == []
+
+
+def test_best_checkpoint_preview_uses_best_and_preserves_live_module(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    model_config = _tiny_model_config() | {"norm_pix_loss": False}
+    best = VideoMAEPretrainingModule(model_config)
+    live = VideoMAEPretrainingModule(model_config)
+    with torch.no_grad():
+        best.model.decoder.head.weight.zero_()
+        best.model.decoder.head.bias.fill_(0.1)
+        live.model.decoder.head.weight.zero_()
+        live.model.decoder.head.bias.fill_(0.9)
+    best_path = tmp_path / "best.ckpt"
+    last_path = tmp_path / "last.ckpt"
+    torch.save({"state_dict": best.state_dict()}, best_path)
+    torch.save({"state_dict": live.state_dict()}, last_path)
+    checkpoint = SimpleNamespace(best_model_path=str(best_path), last_model_path=str(last_path))
+    experiment = _FakeExperiment()
+    trainer = _media_trainer(WandbLogger(experiment), epoch=2)
+    callback = _media_callback(checkpoint)
+    callback.on_validation_batch_end(trainer, live, None, _media_batch(), 0)
+    experiment.calls.clear()
+    before = {
+        name: value.detach().cpu().numpy().tobytes() for name, value in live.named_parameters()
+    }
+
+    callback.on_fit_end(trainer, live)
+
+    assert len(experiment.calls) == 1
+    payload, step = experiment.calls[0]
+    assert set(payload) == {
+        "media/best_inputs",
+        "media/best_reconstruction",
+        "trainer/global_step",
+    }
+    assert step is None
+    assert payload["trainer/global_step"] == 7
+    reconstruction = payload["media/best_reconstruction"]
+    assert isinstance(reconstruction, _FakeImage)
+    assert np.isclose(reconstruction.data[:, 32:48], 0.1).any()
+    assert not np.isclose(reconstruction.data[:, 32:48], 0.9).any()
+    assert all(
+        value.detach().cpu().numpy().tobytes() == before[name]
+        for name, value in live.named_parameters()
+    )
+
+
+def test_best_checkpoint_preview_warns_and_skips_when_path_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    experiment = _FakeExperiment()
+    trainer = _media_trainer(WandbLogger(experiment), epoch=2)
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    callback = _media_callback(SimpleNamespace(best_model_path=""))
+    callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
+    experiment.calls.clear()
+
+    with pytest.warns(UserWarning, match="best checkpoint"):
+        callback.on_fit_end(trainer, module)
+
+    assert experiment.calls == []
+
+
+def test_best_checkpoint_preview_is_rank_zero_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    checkpoint_path = tmp_path / "best.ckpt"
+    torch.save({"state_dict": module.state_dict()}, checkpoint_path)
+    experiment = _FakeExperiment()
+    trainer = _media_trainer(WandbLogger(experiment), epoch=2)
+    callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
+    callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
+    experiment.calls.clear()
+    trainer.global_rank = 1
+
+    callback.on_fit_end(trainer, module)
+
+    assert experiment.calls == []
+
+
+def test_best_checkpoint_preview_uses_sample_from_non_periodic_epoch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    checkpoint_path = tmp_path / "best.ckpt"
+    torch.save({"state_dict": module.state_dict()}, checkpoint_path)
+    experiment = _FakeExperiment()
+    trainer = _media_trainer(WandbLogger(experiment), epoch=1)
+    callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
+
+    callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
+    assert experiment.calls == []
+    callback.on_fit_end(trainer, module)
+
+    assert len(experiment.calls) == 1
+    payload, _ = experiment.calls[0]
+    assert set(payload) == {
+        "media/best_inputs",
+        "media/best_reconstruction",
+        "trainer/global_step",
+    }
+
+
+def test_media_callback_uses_lightning_logger_without_explicit_wandb_steps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    checkpoint_path = tmp_path / "best.ckpt"
+    torch.save({"state_dict": module.state_dict()}, checkpoint_path)
+    experiment = _FakeExperiment()
+    logger = WandbLogger(experiment)
+    trainer = _media_trainer(logger, epoch=2)
+    callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
+    for step in range(8):
+        logger.log_metrics({"train/loss": float(step)}, step=step)
+
+    callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
+    callback.on_fit_end(trainer, module)
+
+    assert {
+        "media/validation_inputs",
+        "media/validation_reconstruction",
+        "media/best_inputs",
+        "media/best_reconstruction",
+    } <= experiment.history.keys()
+    assert experiment.explicit_steps == []
+    assert experiment.finished is False
+
+
+def test_best_checkpoint_preview_loads_checkpoint_with_safe_torch_options(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    checkpoint_path = tmp_path / "best.ckpt"
+    calls: list[tuple[Path, dict[str, object]]] = []
+
+    def _safe_load(path: Path, **kwargs: object) -> dict[str, object]:
+        calls.append((path, kwargs))
+        return {"state_dict": module.state_dict()}
+
+    monkeypatch.setattr(torch, "load", _safe_load)
+    experiment = _FakeExperiment()
+    trainer = _media_trainer(WandbLogger(experiment), epoch=2)
+    callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
+    callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
+
+    callback.on_fit_end(trainer, module)
+
+    assert calls == [
+        (
+            checkpoint_path,
+            {"map_location": "cpu", "weights_only": True, "mmap": True},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing", "checkpoint could not be loaded"),
+        ("corrupt", "checkpoint could not be loaded"),
+        ("incompatible", "checkpoint state is incompatible"),
+    ],
+)
+def test_best_checkpoint_preview_warnings_do_not_leak_paths_or_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    sentinel = "PRIVATE-CHECKPOINT-PATH-SENTINEL"
+    checkpoint_path = tmp_path / sentinel / f"{case}.ckpt"
+    checkpoint_path.parent.mkdir()
+    if case == "corrupt":
+        checkpoint_path.write_bytes(b"not a pytorch archive")
+    elif case == "incompatible":
+        torch.save({"state_dict": {sentinel: torch.tensor(1)}}, checkpoint_path)
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    experiment = _FakeExperiment()
+    trainer = _media_trainer(WandbLogger(experiment), epoch=2)
+    callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
+    callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
+    experiment.calls.clear()
+
+    with pytest.warns(UserWarning) as warnings:
+        callback.on_fit_end(trainer, module)
+
+    assert experiment.calls == []
+    assert [str(warning.message) for warning in warnings] == [
+        f"best checkpoint media skipped: {message}"
+    ]
+    assert sentinel not in str(warnings[0].message)
+
+
+def test_best_checkpoint_preview_loads_real_lightning_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    last_checkpoint = run_pretraining(_smoke_config(tmp_path, max_steps=2))
+    best_checkpoint = next(
+        path for path in last_checkpoint.parent.glob("*.ckpt") if path != last_checkpoint
+    )
+    module = VideoMAEPretrainingModule(_tiny_model_config())
+    experiment = _FakeExperiment()
+    trainer = _media_trainer(WandbLogger(experiment), epoch=2)
+    callback = _media_callback(SimpleNamespace(best_model_path=str(best_checkpoint)))
+    callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
+    experiment.calls.clear()
+
+    callback.on_fit_end(trainer, module)
+
+    payload, step = experiment.calls[0]
+    assert set(payload) >= {"media/best_inputs", "media/best_reconstruction"}
+    assert step is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("media_log_every_n_epochs", 0),
+        ("media_log_every_n_epochs", -1),
+        ("media_log_every_n_epochs", "1"),
+        ("media_log_every_n_epochs", 1.5),
+        ("media_max_frames", 0),
+        ("media_max_frames", -1),
+        ("media_max_frames", 5),
+        ("media_max_frames", "4"),
+        ("media_max_frames", 1.5),
+    ],
+)
+def test_media_config_rejects_non_positive_and_non_integer_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    key: str,
+    value: object,
+) -> None:
+    cfg = _smoke_config(tmp_path, max_steps=1)
+    cfg.tracking[key] = value
+    monkeypatch.setattr(
+        "marineworld.train.pretrain.build_data_adapter",
+        lambda *_: pytest.fail("config must fail before adapter construction"),
+    )
+    monkeypatch.setattr(
+        "marineworld.train.pretrain.build_wandb_logger",
+        lambda *_: pytest.fail("config must fail before logger construction"),
+    )
+
+    with pytest.raises(ValueError, match=f"tracking.{key} must be positive"):
+        run_pretraining(cfg)
+
+
+@pytest.mark.parametrize("value", ["false", "off", 1, 0, None])
+def test_media_config_rejects_non_boolean_log_media_before_construction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
+) -> None:
+    cfg = _smoke_config(tmp_path, max_steps=1)
+    cfg.tracking.log_media = value
+    monkeypatch.setattr(
+        "marineworld.train.pretrain.build_data_adapter",
+        lambda *_: pytest.fail("config must fail before adapter construction"),
+    )
+    monkeypatch.setattr(
+        "marineworld.train.pretrain.build_wandb_logger",
+        lambda *_: pytest.fail("config must fail before logger construction"),
+    )
+
+    with pytest.raises(ValueError, match="tracking.log_media must be boolean"):
+        run_pretraining(cfg)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_media_config_accepts_boolean_log_media(tmp_path: Path, value: bool) -> None:
+    cfg = _smoke_config(tmp_path, max_steps=1)
+    cfg.tracking.log_media = value
+
+    assert _validate_media_config(cfg) is None
+
+
+def test_wandb_tracking_enables_media_by_default() -> None:
+    cfg = _compose_config("data=synthetic", "model=videomae_tiny", "runtime=local_smoke")
+
+    assert cfg.tracking.log_media is True
+    assert cfg.tracking.media_log_every_n_epochs == 1
+    assert cfg.tracking.media_max_frames == 4
+
+
 def _fvessel_manifest(root: Path, *, videos: int = 8) -> tuple[FVesselAdapter, DatasetManifest]:
     for index in range(videos):
         sample = root / f"sample-{index:02d}"
@@ -361,6 +816,38 @@ def test_resolved_config_keeps_non_secret_tokenizer_settings() -> None:
     cfg = OmegaConf.create({"model": {"tokenizer": "videomae"}})
 
     assert resolved_config(cfg) == {"model": {"tokenizer": "videomae"}}
+
+
+@pytest.mark.parametrize("data_config", ["synthetic", "joint_synthetic"])
+def test_resolved_config_removes_only_private_paths_from_wandb_config(data_config: str) -> None:
+    first = _compose_config(f"data={data_config}", "model=videomae_tiny", "runtime=local_smoke")
+    second = _compose_config(f"data={data_config}", "model=videomae_tiny", "runtime=local_smoke")
+
+    def _set_private_values(cfg: DictConfig, sentinel: str) -> None:
+        cfg.output_dir = f"/{sentinel}/outputs"
+        cfg.runtime.ckpt_path = f"/{sentinel}/checkpoint.ckpt"
+        cfg.data.root = f"/{sentinel}/data"
+        for component in cfg.data.get("components", {}).values():
+            component.root = f"/{sentinel}/{component.adapter._target_}"
+        OmegaConf.update(cfg, "tracking.api_key", f"{sentinel}-secret", force_add=True)
+
+    _set_private_values(first, "PRIVATE-PATH-A")
+    _set_private_values(second, "PRIVATE-PATH-B")
+
+    sanitized = resolved_config(first)
+    serialized = json.dumps(sanitized)
+    assert resolved_config(second) == sanitized
+    assert "PRIVATE-PATH" not in serialized
+    assert "output_dir" not in sanitized
+    assert "ckpt_path" not in sanitized["runtime"]
+    assert "root" not in sanitized["data"]
+    assert all(
+        "root" not in component for component in sanitized["data"].get("components", {}).values()
+    )
+    assert "api_key" not in sanitized["tracking"]
+    assert sanitized["model"]["name"] == "videomae_tiny"
+    assert sanitized["data"]["transforms"]["normalization"]["mean"] == [0.485, 0.456, 0.406]
+    assert sanitized["runtime"]["batch_size"] == 1
 
 
 def test_importing_experiment_does_not_mutate_environment() -> None:

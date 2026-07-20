@@ -15,6 +15,11 @@ if TYPE_CHECKING:
 
 
 _SECRET_KEY_SUFFIXES = ("apikey", "password", "secret", "token")
+_PRIVATE_CONFIG_PATHS = {
+    ("data", "root"),
+    ("output_dir",),
+    ("runtime", "ckpt_path"),
+}
 
 
 @dataclass(frozen=True)
@@ -30,7 +35,7 @@ def resolved_config(cfg: DictConfig) -> dict[str, Any]:
     """Resolve a Hydra config into primitive, credential-free values."""
     resolved = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     assert isinstance(resolved, dict)
-    return _without_secrets(resolved)
+    return _sanitize_config(resolved)
 
 
 def build_run_identity(
@@ -99,14 +104,22 @@ def _create_wandb_logger(**kwargs: Any) -> WandbLogger:
     return WandbLogger(**kwargs)
 
 
-def _without_secrets(value: Any) -> Any:
+def _sanitize_config(value: Any, path: tuple[str, ...] = ()) -> Any:
     if isinstance(value, dict):
         return {
-            key: _without_secrets(item) for key, item in value.items() if not _is_secret_key(key)
+            key: _sanitize_config(item, path + (str(key),))
+            for key, item in value.items()
+            if not _is_secret_key(key) and not _is_private_config_path(path + (str(key),))
         }
     if isinstance(value, list):
-        return [_without_secrets(item) for item in value]
+        return [_sanitize_config(item, path) for item in value]
     return value
+
+
+def _is_private_config_path(path: tuple[str, ...]) -> bool:
+    return path in _PRIVATE_CONFIG_PATHS or (
+        len(path) == 4 and path[:2] == ("data", "components") and path[-1] == "root"
+    )
 
 
 def _is_secret_key(key: object) -> bool:
