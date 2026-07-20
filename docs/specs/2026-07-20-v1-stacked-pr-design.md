@@ -8,7 +8,7 @@ as the foundation scaffold and retaining all existing work in recoverable Git hi
 ## Stack
 
 1. `chore/v1-foundation-scaffold` targets `main`. It contains the v1 design and plan,
-   Python 3.13.14 developer default, the `>=3.11` package floor, compatible dependency
+   Python 3.13.7 developer default, the `>=3.11` package floor, compatible dependency
    metadata and lockfile, Ruff `py313`, and Hydra/tooling skeletons.
 2. `feat/maritime-data-pipeline` targets `chore/v1-foundation-scaffold`. It contains
    canonical manifests, adapters, splitting, clip sampling, video decoding, the PyAV

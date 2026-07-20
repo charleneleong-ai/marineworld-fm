@@ -2,7 +2,7 @@
 
 ## Goal
 
-Make CPython 3.13.14 the repository's default developer runtime without dropping the
+Make CPython 3.13.7 the repository's default developer runtime without dropping the
 declared Python 3.11 compatibility floor, then prove the real-data path on macOS with a
 small, reproducible FVessel Clip-10 training run logged to W&B.
 
@@ -22,7 +22,7 @@ This design was checked on 2026-07-20 against primary sources:
 
 ## Runtime and dependency contract
 
-- Pin `.python-version` and `mise.toml` to CPython 3.13.14 and set Ruff's target to
+- Pin `.python-version` and `mise.toml` to the uv-managed CPython 3.13.7 macOS build and set Ruff's target to
   `py313`.
 - Retain `project.requires-python = ">=3.11"`; Python 3.13 is the contributor default,
   not a new package minimum.
@@ -84,7 +84,7 @@ runtime artifacts are never committed.
 
 The change is accepted when:
 
-1. `python --version` reports 3.13.14 through the project toolchain while package metadata
+1. `python --version` reports 3.13.7 through the project toolchain while package metadata
    still declares Python 3.11+.
 2. The dependency lock resolves and the full test, Ruff, and pre-commit suites pass under
    Python 3.13.

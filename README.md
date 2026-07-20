@@ -42,6 +42,9 @@ marineworld-fm/
 
 ## Quick start
 
+The developer toolchain defaults to Python 3.13.7; package metadata retains Python
+3.11+ compatibility.
+
 ```bash
 # Install tool versions + deps (uses mise + pip).
 mise trust && mise run setup

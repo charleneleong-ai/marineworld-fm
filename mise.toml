@@ -5,7 +5,7 @@ PYTHONUNBUFFERED = "1"
 PYTHONDONTWRITEBYTECODE = "1"
 
 [tools]
-python = "3.11.9"
+python = "3.13.7"
 
 [tasks]
 # Install development dependencies (core + train + dev).

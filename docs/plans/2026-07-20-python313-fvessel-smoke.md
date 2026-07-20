@@ -2,15 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make Python 3.13.14 the local default, add a tested PyAV video fallback, and complete a bounded real FVessel Clip-10 smoke run in W&B.
+**Goal:** Make Python 3.13.7 the local default, add a tested PyAV video fallback, and complete a bounded real FVessel Clip-10 smoke run in W&B.
 
 **Architecture:** Keep Python 3.11 as the package floor while resolving the training environment on Python 3.13. Move all optional video-backend selection into `marineworld.data.video`: Decord remains preferred and PyAV provides metadata and indexed RGB decoding on macOS. A small Typer downloader validates and safely extracts the official FVessel archive, after which the existing adapter and training entrypoint run a dedicated real-data smoke profile.
 
-**Tech Stack:** CPython 3.13.14, uv, PyTorch 2.6+, Decord, PyAV, Typer, Hydra, Lightning, pytest, W&B, Hugging Face FVessel.
+**Tech Stack:** CPython 3.13.7, uv, PyTorch 2.6+, Decord, PyAV, Typer, Hydra, Lightning, pytest, W&B, Hugging Face FVessel.
 
 ## Global Constraints
 
-- `.python-version` and `mise.toml` must default to exactly Python 3.13.14.
+- `.python-version` and `mise.toml` must default to exactly Python 3.13.7.
 - `project.requires-python` must remain exactly `>=3.11`.
 - Decord is preferred when importable; PyAV is the fallback.
 - Optional video libraries remain lazily imported.
@@ -33,7 +33,7 @@
 
 **Interfaces:**
 - Consumes: existing `train` and `dev` optional dependency groups.
-- Produces: a Python 3.13.14 default environment whose package metadata remains installable on Python 3.11+.
+- Produces: a Python 3.13.7 default environment whose package metadata remains installable on Python 3.11+.
 
 - [ ] **Step 1: Change the tooling contract test first**
 
@@ -47,8 +47,8 @@ def test_project_defaults_to_python_313_without_raising_package_floor() -> None:
 
     assert config["project"]["requires-python"] == ">=3.11"
     assert config["tool"]["ruff"]["target-version"] == "py313"
-    assert (root / ".python-version").read_text().strip() == "3.13.14"
-    assert mise["tools"]["python"] == "3.13.14"
+    assert (root / ".python-version").read_text().strip() == "3.13.7"
+    assert mise["tools"]["python"] == "3.13.7"
 ```
 
 - [ ] **Step 2: Verify RED**
@@ -59,7 +59,7 @@ Expected: FAIL because the repository still targets Python 3.11.9/`py311`.
 
 - [ ] **Step 3: Update runtime and dependency declarations**
 
-Set `.python-version` and `mise.toml` to `3.13.14`, Ruff to `py313`, add `av>=18,<19` and `typer>=0.16,<1`, retain the non-Darwin Decord marker, and replace the old PyTorch/Lightning constraints with resolver-tested Python-3.13-compatible ranges. Start with:
+Set `.python-version` and `mise.toml` to `3.13.7`, Ruff to `py313`, add `av>=18,<19` and `typer>=0.16,<1`, retain the non-Darwin Decord marker, and replace the old PyTorch/Lightning constraints with resolver-tested Python-3.13-compatible ranges. Start with:
 
 ```toml
 "torch>=2.6,<3",
@@ -69,19 +69,19 @@ Set `.python-version` and `mise.toml` to `3.13.14`, Ruff to `py313`, add `av>=18
 "typer>=0.16,<1",
 ```
 
-Run `uv lock --python 3.13.14`; narrow only if the resolver or test suite demonstrates an incompatibility. Update README setup text to identify 3.13.14 as the default and 3.11 as the supported floor.
+Run `uv lock --python 3.13.7`; narrow only if the resolver or test suite demonstrates an incompatibility. Update README setup text to identify 3.13.7 as the default and 3.11 as the supported floor.
 
 - [ ] **Step 4: Verify GREEN under Python 3.13**
 
 Run:
 
 ```bash
-uv run --python 3.13.14 --extra train --extra dev python --version
-uv run --python 3.13.14 --extra train --extra dev pytest tests/test_training.py::test_project_defaults_to_python_313_without_raising_package_floor -q
-uv run --python 3.13.14 --extra train --extra dev python -c 'import av, torch; print(av.__version__, torch.__version__)'
+uv run --python 3.13.7 --extra train --extra dev python --version
+uv run --python 3.13.7 --extra train --extra dev pytest tests/test_training.py::test_project_defaults_to_python_313_without_raising_package_floor -q
+uv run --python 3.13.7 --extra train --extra dev python -c 'import av, torch; print(av.__version__, torch.__version__)'
 ```
 
-Expected: Python 3.13.14, one passing test, and importable PyAV/PyTorch versions.
+Expected: Python 3.13.7, one passing test, and importable PyAV/PyTorch versions.
 
 - [ ] **Step 5: Review, pre-commit, and commit**
 
@@ -144,7 +144,7 @@ Add analogous probe tests for Decord preference, PyAV fallback, positive metadat
 
 - [ ] **Step 2: Verify RED**
 
-Run: `uv run --python 3.13.14 --extra train --extra dev pytest tests/test_data.py -q`
+Run: `uv run --python 3.13.7 --extra train --extra dev pytest tests/test_data.py -q`
 
 Expected: FAIL because `VideoMetadata`, `probe_video_fps`, and `AutoVideoDecoder` do not exist.
 
@@ -182,8 +182,8 @@ Move `probe_video_fps` into `video.py`, keep `probe_video_frame_count` as a wrap
 Run:
 
 ```bash
-uv run --python 3.13.14 --extra train --extra dev pytest tests/test_data.py tests/test_training.py -q
-uv run --python 3.13.14 --extra dev ruff check src/marineworld/data tests/test_data.py --select E,W,F,I
+uv run --python 3.13.7 --extra train --extra dev pytest tests/test_data.py tests/test_training.py -q
+uv run --python 3.13.7 --extra dev ruff check src/marineworld/data tests/test_data.py --select E,W,F,I
 ```
 
 Expected: all selected tests and Ruff checks pass.
@@ -242,7 +242,7 @@ Also test successful nested extraction, invalid ZIP rejection, `.part` cleanup o
 
 - [ ] **Step 2: Verify RED**
 
-Run: `uv run --python 3.13.14 --extra train --extra dev pytest tests/test_data.py tests/test_training.py -q`
+Run: `uv run --python 3.13.7 --extra train --extra dev pytest tests/test_data.py tests/test_training.py -q`
 
 Expected: FAIL because the downloader and `real_smoke` profile do not exist.
 
@@ -273,9 +273,9 @@ Replace the existing informational mise download entry with `download:fvessel-cl
 Run:
 
 ```bash
-uv run --python 3.13.14 --extra train --extra dev pytest tests/test_data.py tests/test_training.py -q
-uv run --python 3.13.14 --extra dev ruff check src/ tests/ --select E,W,F,I
-uv run --python 3.13.14 --extra dev ruff format --check src/ tests/
+uv run --python 3.13.7 --extra train --extra dev pytest tests/test_data.py tests/test_training.py -q
+uv run --python 3.13.7 --extra dev ruff check src/ tests/ --select E,W,F,I
+uv run --python 3.13.7 --extra dev ruff format --check src/ tests/
 ```
 
 Expected: all selected tests, Ruff lint, and formatting checks pass.
@@ -301,14 +301,14 @@ git commit -m "feat: add reproducible FVessel smoke run"
 - Consumes: `mise run download:fvessel-clip10` and `mise run smoke:fvessel`.
 - Produces: a completed W&B run URL and reproducible verification evidence in PR #1.
 
-- [ ] **Step 1: Verify the entire repository on Python 3.13.14**
+- [ ] **Step 1: Verify the entire repository on Python 3.13.7**
 
 Run:
 
 ```bash
-WANDB_MODE=disabled uv run --python 3.13.14 --extra train --extra dev pytest -q tests/
-uv run --python 3.13.14 --extra dev ruff check src/ tests/ --select E,W,F,I
-uv run --python 3.13.14 --extra dev ruff format --check src/ tests/
+WANDB_MODE=disabled uv run --python 3.13.7 --extra train --extra dev pytest -q tests/
+uv run --python 3.13.7 --extra dev ruff check src/ tests/ --select E,W,F,I
+uv run --python 3.13.7 --extra dev ruff format --check src/ tests/
 uvx pre-commit run --all-files
 git diff --check
 ```

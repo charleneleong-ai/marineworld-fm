@@ -6,7 +6,7 @@
 
 **Architecture:** Snapshot the current tip locally and remotely, reconstruct branches from `main` at functional boundaries, and use GitHub's branch-rename endpoint so PR #1 keeps its number while its head becomes `chore/v1-foundation-scaffold`. Each later branch is based on the previous branch and contains only its layer's files/commits.
 
-**Tech Stack:** Git worktrees, GitHub CLI/API, uv, Python 3.13.14, pytest, Ruff, pre-commit.
+**Tech Stack:** Git worktrees, GitHub CLI/API, uv, Python 3.13.7, pytest, Ruff, pre-commit.
 
 ## Global Constraints
 
@@ -14,7 +14,7 @@
 - Preserve the current tip as `backup/v1-videomae-foundation-20260720` locally and remotely before rewriting anything.
 - Use only `--force-with-lease` for rewritten remote refs.
 - PR #1 must remain open and retain number 1 after the remote branch rename.
-- Branch 1 is exactly `chore/v1-foundation-scaffold` and includes Python 3.13.14.
+- Branch 1 is exactly `chore/v1-foundation-scaffold` and includes Python 3.13.7.
 - Every later PR targets the immediately preceding stack branch.
 - No dataset, checkpoint, secret, W&B media file, or runtime output may enter Git.
 
@@ -48,9 +48,9 @@
 
 - [ ] Create a separate reconstruction worktree from `main` so the backup/full branch remains untouched.
 - [ ] Restore only the approved scaffold files from the backup ref, then remove configs/tests that require later implementations.
-- [ ] Change the developer default to Python 3.13.14, keep `requires-python = ">=3.11"`, set Ruff `py313`, and resolve Python-3.13-compatible training constraints plus `uv.lock`.
+- [ ] Change the developer default to Python 3.13.7, keep `requires-python = ">=3.11"`, set Ruff `py313`, and resolve Python-3.13-compatible training constraints plus `uv.lock`.
 - [ ] Add or retain one focused test asserting `.python-version`, mise, Ruff, and package-floor contracts; verify it fails before the version edits and passes afterward.
-- [ ] Run scaffold tests, Ruff, pre-commit, and `git diff --check` under Python 3.13.14.
+- [ ] Run scaffold tests, Ruff, pre-commit, and `git diff --check` under Python 3.13.7.
 - [ ] Run the required simplify review, fold valid findings into the same commit, and commit with conventional subjects.
 - [ ] Rename the existing remote PR head `feat/v1-videomae-foundation` to `chore/v1-foundation-scaffold` through `POST /repos/charleneleong-ai/marineworld-fm/branches/feat%2Fv1-videomae-foundation/rename` with `new_name=chore/v1-foundation-scaffold`; do not pre-create the destination ref.
 - [ ] Verify PR #1 is still open, numbered 1, based on `main`, and headed by `chore/v1-foundation-scaffold`; stop if any assertion fails.

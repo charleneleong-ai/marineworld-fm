@@ -207,12 +207,39 @@ def test_load_and_align_end_to_end(tmp_path):
     # Two vessels, one dropping out mid-clip.
     df = pd.DataFrame(
         [
-            {"Number": 0, "MMSI": 111, "Lon": 10.0, "Lat": 0.0, "Speed": 5.0,
-             "Course": 90.0, "Heading": 90.0, "Type": 70, "Timestamp": 1000},
-            {"Number": 1, "MMSI": 111, "Lon": 12.0, "Lat": 0.0, "Speed": 5.0,
-             "Course": 90.0, "Heading": 90.0, "Type": 70, "Timestamp": 2000},
-            {"Number": 2, "MMSI": 222, "Lon": 30.0, "Lat": 1.0, "Speed": 3.0,
-             "Course": 180.0, "Heading": 511.0, "Type": 60, "Timestamp": 1000},
+            {
+                "Number": 0,
+                "MMSI": 111,
+                "Lon": 10.0,
+                "Lat": 0.0,
+                "Speed": 5.0,
+                "Course": 90.0,
+                "Heading": 90.0,
+                "Type": 70,
+                "Timestamp": 1000,
+            },
+            {
+                "Number": 1,
+                "MMSI": 111,
+                "Lon": 12.0,
+                "Lat": 0.0,
+                "Speed": 5.0,
+                "Course": 90.0,
+                "Heading": 90.0,
+                "Type": 70,
+                "Timestamp": 2000,
+            },
+            {
+                "Number": 2,
+                "MMSI": 222,
+                "Lon": 30.0,
+                "Lat": 1.0,
+                "Speed": 3.0,
+                "Course": 180.0,
+                "Heading": 511.0,
+                "Type": 60,
+                "Timestamp": 1000,
+            },
         ]
     )
     csv = tmp_path / "ais.csv"
