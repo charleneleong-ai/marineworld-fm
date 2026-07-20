@@ -6,5 +6,12 @@ patch_size: 16
 tubelet_size: 2
 num_frames: 16
 image_size: 224
+hidden_size: 384
+num_hidden_layers: 12
+num_attention_heads: 6
+intermediate_size: 1536
 mask_ratio: 0.9          # high ratio per VideoMAE (temporal redundancy)
-decoder_depth: 4
+decoder_hidden_size: 192
+decoder_num_hidden_layers: 4
+decoder_num_attention_heads: 3
+decoder_intermediate_size: 768

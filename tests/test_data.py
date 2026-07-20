@@ -12,7 +12,9 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from typer.testing import CliRunner
 
+from marineworld.data import download as download_module
 from marineworld.data import video
 from marineworld.data.adapters import DatasetAdapter, build_adapter
 from marineworld.data.clips import (
@@ -23,6 +25,7 @@ from marineworld.data.clips import (
     build_clip_index,
 )
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
+from marineworld.data.download import app as download_app
 from marineworld.data.download import safe_extract_zip
 from marineworld.data.fvessel import FVesselAdapter
 from marineworld.data.manifest import manifest_checksum, validate_manifest
@@ -117,11 +120,37 @@ def test_manifest_rejects_video_leakage(tmp_path: Path):
 
 
 def test_manifest_checksum_is_order_independent(tmp_path: Path):
+    (tmp_path / "a.mp4").touch()
+    (tmp_path / "b.mp4").touch()
     first = _record(tmp_path / "a.mp4", record_id="a", split="train")
     second = _record(tmp_path / "b.mp4", record_id="b", split="val")
     assert manifest_checksum(_manifest(first, second)) == manifest_checksum(
         _manifest(second, first)
     )
+
+
+def test_manifest_checksum_is_portable_across_data_roots(tmp_path: Path) -> None:
+    first_root = tmp_path / "machine-a"
+    second_root = tmp_path / "machine-b"
+    first_root.mkdir()
+    second_root.mkdir()
+    (first_root / "clip.mp4").touch()
+    (second_root / "clip.mp4").touch()
+    first = VideoRecord("clip", "demo", first_root / "clip.mp4", "train", "demo", 25.0, 8)
+    second = replace(first, video_path=second_root / "clip.mp4")
+
+    assert manifest_checksum(_manifest(first)) == manifest_checksum(_manifest(second))
+
+
+def test_manifest_checksum_changes_with_video_content(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"first")
+    record = VideoRecord("clip", "demo", video, "train", "demo", 25.0, 8)
+    first = manifest_checksum(_manifest(record))
+
+    video.write_bytes(b"second")
+
+    assert manifest_checksum(_manifest(record)) != first
 
 
 @pytest.mark.parametrize(
@@ -346,14 +375,46 @@ def test_auto_decoder_falls_back_to_pyav(
     assert decoded[:, 0, 0, 0].tolist() == [2, 0, 2]
 
 
+def test_auto_decoder_recovers_from_decord_decode_failure(
+    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
+
+    def fail_decord(*_: object) -> torch.Tensor:
+        raise video.VideoDecodeError("Decord rejected malformed H.264 packets")
+
+    monkeypatch.setattr(video, "_decord_decode", fail_decord)
+    monkeypatch.setattr(video, "_pyav_decode", lambda *_: frames)
+
+    assert AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,)) is frames
+
+
+def test_auto_decoder_does_not_mask_programmer_errors(
+    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = RuntimeError("unexpected tensor contract bug")
+
+    def fail_unexpectedly(*_: object) -> torch.Tensor:
+        raise error
+
+    monkeypatch.setattr(video, "_decord_decode", fail_unexpectedly)
+
+    with pytest.raises(RuntimeError) as caught:
+        AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+    assert caught.value is error
+
+
 def test_auto_decoder_names_both_missing_backends(
     synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(video, "_decord_decode", _backend_unavailable)
     monkeypatch.setattr(video, "_pyav_decode", _backend_unavailable)
 
-    with pytest.raises(RuntimeError, match="decord.*PyAV"):
+    with pytest.raises(RuntimeError, match="decord: unavailable; PyAV: unavailable") as caught:
         AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+    assert isinstance(caught.value.__cause__, VideoBackendUnavailable)
 
 
 def test_video_probe_prefers_decord(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -406,6 +467,17 @@ def test_safe_extract_zip_preserves_nested_files(tmp_path: Path) -> None:
     safe_extract_zip(archive, destination)
 
     assert (destination / "sample" / "video.mp4").read_text() == "video"
+
+
+def test_fvessel_downloader_exposes_named_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(download_module, "download_fvessel_clip10", lambda output: output)
+    result = CliRunner().invoke(
+        download_app, ["fvessel-clip10", "--output", str(tmp_path / "fvessel")]
+    )
+
+    assert result.exit_code == 0
 
 
 def test_clip_dataset_caches_and_filters_adapter_targets(

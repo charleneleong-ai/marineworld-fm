@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 
 from marineworld.data.contracts import DatasetManifest, VideoRecord
@@ -66,15 +67,43 @@ def _serialize_record(record: VideoRecord) -> dict[str, object]:
     return {
         "id": record.id,
         "dataset": record.dataset,
-        "video_path": str(_canonical_path(record.video_path)),
         "split": record.split,
         "source": record.source,
         "fps": record.fps,
         "num_frames": record.num_frames,
-        "annotation_path": (
-            str(_canonical_path(record.annotation_path))
-            if record.annotation_path is not None
-            else None
+        "video_checksum": file_checksum(record.video_path),
+        "annotation_checksum": (
+            file_checksum(record.annotation_path) if record.annotation_path is not None else None
         ),
         "metadata": dict(record.metadata),
     }
+
+
+def file_checksum(path: Path) -> str:
+    """Return a content digest that is independent of the file's local path."""
+    canonical = _canonical_path(path)
+    stat = canonical.stat()
+    return cached_file_checksum(canonical, stat.st_size, stat.st_mtime_ns)
+
+
+def directory_checksum(root: Path) -> str:
+    """Hash a directory tree using portable relative names and file contents."""
+    canonical = _canonical_path(root)
+    digest = hashlib.sha256(b"marineworld-directory-v1\0")
+    for path in sorted(candidate for candidate in canonical.rglob("*") if candidate.is_file()):
+        relative_name = path.relative_to(canonical).as_posix().encode()
+        content_digest = bytes.fromhex(file_checksum(path))
+        digest.update(b"file\0")
+        digest.update(len(relative_name).to_bytes(8, "big"))
+        digest.update(relative_name)
+        digest.update(len(content_digest).to_bytes(8, "big"))
+        digest.update(content_digest)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=512)
+def cached_file_checksum(path: Path, size: int, modified_ns: int) -> str:
+    """Cache content digests while file size and modification time are unchanged."""
+    del size, modified_ns
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()

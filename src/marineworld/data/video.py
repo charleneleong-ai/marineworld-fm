@@ -25,6 +25,10 @@ class VideoBackendUnavailable(RuntimeError):
     """Raised when an optional video backend is not installed."""
 
 
+class VideoDecodeError(RuntimeError):
+    """Raised when a video backend cannot decode a requested frame set."""
+
+
 def probe_video(path: Path) -> VideoMetadata:
     """Probe video metadata with Decord first and PyAV second."""
     for probe in (_decord_probe, _pyav_probe):
@@ -47,12 +51,16 @@ def probe_video_fps(path: Path) -> float:
 
 def decode_video(record: VideoRecord, frame_indices: tuple[int, ...]) -> torch.Tensor:
     """Decode indexed RGB frames with Decord first and PyAV second."""
-    for decode in (_decord_decode, _pyav_decode):
+    failures: list[tuple[str, RuntimeError]] = []
+    for backend, decode in (("decord", _decord_decode), ("PyAV", _pyav_decode)):
         try:
             return decode(record, frame_indices)
-        except VideoBackendUnavailable:
-            continue
-    raise RuntimeError("video decoding requires optional dependency 'decord' or 'PyAV'")
+        except (VideoBackendUnavailable, VideoDecodeError) as error:
+            failures.append((backend, error))
+    details = "; ".join(f"{backend}: {error}" for backend, error in failures)
+    raise RuntimeError(
+        f"video decoding failed with all supported backends ({details})"
+    ) from failures[-1][1]
 
 
 def _validate_metadata(metadata: VideoMetadata) -> VideoMetadata:
@@ -81,7 +89,7 @@ def _decord_decode(record: VideoRecord, frame_indices: tuple[int, ...]) -> torch
     try:
         frames = VideoReader(str(record.video_path)).get_batch(list(frame_indices)).asnumpy()
     except Exception as error:
-        raise RuntimeError(f"could not decode frames for record {record.id}") from error
+        raise VideoDecodeError(f"could not decode frames for record {record.id}") from error
     return torch.from_numpy(frames).permute(0, 3, 1, 2)
 
 
@@ -117,10 +125,10 @@ def _pyav_decode(record: VideoRecord, frame_indices: tuple[int, ...]) -> torch.T
                 if index >= max(requested):
                     break
     except Exception as error:
-        raise RuntimeError(f"could not decode frames for record {record.id}") from error
+        raise VideoDecodeError(f"could not decode frames for record {record.id}") from error
     missing = requested.difference(decoded)
     if missing:
-        raise RuntimeError(f"record {record.id} is missing requested frames")
+        raise VideoDecodeError(f"record {record.id} is missing requested frames")
     return torch.stack([decoded[index] for index in frame_indices])
 
 

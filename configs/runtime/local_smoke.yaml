@@ -1,0 +1,12 @@
+# Small, deterministic local execution profile.
+tracking_mode: offline
+accelerator: cpu
+devices: 1
+precision: 32-true
+batch_size: 1
+accumulate_grad_batches: 1
+num_workers: 0
+max_steps: 2
+limit_train_batches: 2
+limit_val_batches: 1
+ckpt_path: null

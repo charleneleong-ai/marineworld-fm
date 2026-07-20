@@ -136,7 +136,8 @@ Each supervised probe uses 1%, 5%, 10%, and 100% of labelled training videos wit
 - Gradient accumulation configured from effective batch size.
 - Explicit best and last checkpoints.
 - L4 and A100 profiles differ only in batch, accumulation, worker, and precision settings.
-- Resume uses a stable W&B run ID and `Trainer.fit(ckpt_path=...)`.
+- Resume uses `Trainer.fit(ckpt_path=...)` and starts a unique, non-resuming W&B attempt
+  grouped under the same scientific condition, with checkpoint provenance attached.
 
 ## W&B experiment contract
 
@@ -144,7 +145,9 @@ All training and probe entrypoints construct logging through one experiment fact
 
 - Modes are `online`, `offline`, and `disabled`; smoke defaults to `offline`, cloud to `online`.
 - Convert the fully resolved Hydra `DictConfig` into primitive containers before logging.
-- Run identity includes model condition, manifest checksums, label fraction, seed, git SHA, accelerator, and checkpoint provenance.
+- Each run records a portable condition fingerprint over model/train/data settings,
+  manifest checksums, label fraction, and seed. Every execution receives a unique attempt
+  ID; source revision, accelerator, and checkpoint provenance remain linked metadata.
 - Metric namespaces are `pretrain/*`, `val/*`, `probe/<dataset>/*`, and `system/*`.
 - Log manifests, split files, evaluation tables, and online checkpoints as artifacts. Never log raw restricted data or credentials.
 - Online checkpoints use `latest` and `best` aliases. Offline smoke runs keep checkpoints local because Lightning does not support offline mode combined with W&B model artifact logging.
@@ -156,7 +159,8 @@ All training and probe entrypoints construct logging through one experiment fact
 
 - Missing or unlicensed datasets fail before model construction with an actionable dataset-specific message.
 - Optional reference models that exceed device memory are marked `SKIPPED_RESOURCE`, not failed scientific results.
-- Interrupted training preserves the last checkpoint and W&B run ID.
+- Interrupted training preserves the last checkpoint; continuation starts a linked W&B
+  attempt rather than reopening the interrupted run.
 - Non-finite loss terminates the run, records the failing batch metadata without raw frames, and preserves the checkpoint.
 - Probe results are emitted only when the encoder checkpoint, manifest checksum, split, and label subset are all known.
 
@@ -169,7 +173,8 @@ Tests follow red-green TDD and are grouped by area:
 - Tensor shape, mask count, augmentation, and target-alignment behaviour.
 - Tiny model forward/backward and checkpoint-resume smoke tests.
 - Probe freezing, label-subsampling, and metric aggregation tests.
-- W&B disabled/offline tests with no network access, covering resolved configuration, namespaced metrics, stable run identity, and resume metadata.
+- W&B disabled/offline tests with no network access, covering resolved configuration,
+  namespaced metrics, stable condition identity, unique attempt identity, and resume metadata.
 
 No test may require proprietary data, W&B network access, or a GPU.
 

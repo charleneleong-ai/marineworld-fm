@@ -16,6 +16,11 @@ FVESSEL_CLIP10_URL = (
 app = typer.Typer(no_args_is_help=True)
 
 
+@app.callback()
+def main() -> None:
+    """Download and validate public maritime datasets."""
+
+
 def safe_extract_zip(archive: Path, destination: Path) -> None:
     """Extract a ZIP only when every member remains under the destination."""
     destination = destination.resolve()
