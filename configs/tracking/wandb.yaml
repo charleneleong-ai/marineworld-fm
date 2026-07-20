@@ -2,3 +2,6 @@
 mode: ${runtime.tracking_mode}
 project: marineworld-fm
 entity: null
+log_media: true
+media_log_every_n_epochs: 1
+media_max_frames: 4
