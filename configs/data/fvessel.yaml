@@ -3,7 +3,11 @@ name: fvessel
 root: data/raw/fvessel
 num_frames: 16
 image_size: 224
-fps: null              # parsed per-clip in v1; null means "use source fps"
+adapter:
+  _target_: marineworld.data.fvessel.FVesselAdapter
+  version: v1
+  fps: null            # null probes source FPS; a positive value overrides it
+  num_frames: null       # null probes each video's real frame count
 
 # AIS<->frame temporal alignment (see marineworld.data.alignment).
 ais:

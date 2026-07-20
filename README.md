@@ -56,6 +56,19 @@ pip install -e '.[train,dev]'
 pytest -v tests/
 ```
 
+## FVessel Clip-10
+
+Download and safely extract the official 2.56 GB FVessel subset into the ignored local
+data directory:
+
+```bash
+mise run download:fvessel-clip10
+```
+
+The command validates the ZIP before extraction, rejects archive traversal paths, and is
+idempotent once an extracted MP4 is present. The full FVessel V1/V2 archives are not
+downloaded by this task.
+
 ## AIS temporal alignment
 
 `marineworld.data.alignment` maps each video frame timestamp to a per-vessel AIS state:

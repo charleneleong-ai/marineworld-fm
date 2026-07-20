@@ -11,7 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["SMDVideo", "list_videos"]
+from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
+
+__all__ = ["SMDAdapter", "SMDVideo", "list_videos"]
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,34 @@ class SMDVideo:
 
     path: Path
     source: str  # one of: "onshore", "onboard", "nir"
+
+
+@dataclass(frozen=True)
+class SMDAdapter:
+    """Adapt SMD videos while retaining each source subset as native metadata."""
+
+    version: str = "v1"
+    fps: float = 30.0
+    num_frames: int = 16
+
+    def build_manifest(self, root: Path) -> DatasetManifest:
+        records = tuple(
+            VideoRecord(
+                id=video.path.relative_to(root).with_suffix("").as_posix(),
+                dataset="smd",
+                video_path=video.path,
+                split="train",
+                source=video.source,
+                fps=self.fps,
+                num_frames=self.num_frames,
+                metadata={"native_source": video.source},
+            )
+            for video in list_videos(root)
+        )
+        return DatasetManifest("smd", self.version, "restricted", records)
+
+    def load_targets(self, record: VideoRecord) -> tuple[FrameTargets, ...]:
+        return ()
 
 
 def list_videos(root: str | Path) -> list[SMDVideo]:
