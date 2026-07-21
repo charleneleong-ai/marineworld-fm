@@ -38,6 +38,7 @@ from marineworld.train.experiment import (
 )
 from marineworld.train.media import WandbMediaCallback
 from marineworld.train.module import VideoMAEPretrainingModule
+from marineworld.train.naming import metric_name
 from marineworld.utils.seed import seed_everything
 
 __all__ = [
@@ -321,7 +322,7 @@ def _run_with_identity(
     logger = build_wandb_logger(cfg, identity)
     checkpoint = _ExceptionSafeModelCheckpoint(
         dirpath=Path(cfg.output_dir) / "checkpoints",
-        monitor="val/loss",
+        monitor=metric_name("val", "loss"),
         mode="min",
         save_last=True,
         save_top_k=1,

@@ -29,11 +29,11 @@ from marineworld.train.experiment import (
     RunIdentity,
     build_run_identity,
     build_wandb_logger,
-    metric_name,
     resolved_config,
 )
 from marineworld.train.media import WandbMediaCallback, build_media_preview
 from marineworld.train.module import VideoMAEPretrainingModule
+from marineworld.train.naming import metric_name
 from marineworld.train.pretrain import (
     BalancedDatasetSampler,
     _BalancedSamplerCheckpoint,
@@ -405,18 +405,49 @@ def test_media_callback_gates_validation_logging(
     if expected_calls:
         payload, step = experiment.calls[0]
         assert set(payload) == {
-            "media/validation_inputs",
-            "media/validation_reconstruction",
+            "val/synthetic/media/inputs",
+            "val/synthetic/media/reconstruction",
             "trainer/global_step",
         }
         assert step is None
         assert payload["trainer/global_step"] == 7
-        media = {key: image for key, image in payload.items() if key.startswith("media/")}
+        media = {key: image for key, image in payload.items() if "/media/" in key}
         assert all(isinstance(image, _FakeImage) for image in media.values())
         assert all(
             image.caption == "dataset=synthetic source=generated/clip-0" for image in media.values()
         )
-        assert payload["media/validation_inputs"].data.shape == (16, 32, 3)
+        assert payload["val/synthetic/media/inputs"].data.shape == (16, 32, 3)
+
+
+@pytest.mark.parametrize(
+    ("hook", "stage", "dataset"),
+    [
+        ("on_train_batch_end", "pretrain", "synthetic"),
+        ("on_validation_batch_end", "val", "fvessel"),
+        ("on_validation_batch_end", "val", "smd"),
+    ],
+)
+def test_media_keys_are_namespaced_by_stage_and_dataset(
+    monkeypatch: pytest.MonkeyPatch, hook: str, stage: str, dataset: str
+) -> None:
+    """Joint runs must not overwrite one dataset's panel with another's."""
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+    experiment = _FakeExperiment()
+    callback = _media_callback(SimpleNamespace(best_model_path=""))
+
+    getattr(callback, hook)(
+        _media_trainer(WandbLogger(experiment), rank=0, epoch=2),
+        VideoMAEPretrainingModule(_tiny_model_config()),
+        None,
+        _media_batch() | {"dataset": (dataset, "other")},
+        0,
+    )
+
+    payload, _ = experiment.calls[0]
+    assert {key for key in payload if "/media/" in key} == {
+        f"{stage}/{dataset}/media/inputs",
+        f"{stage}/{dataset}/media/reconstruction",
+    }
 
 
 @pytest.mark.parametrize(
@@ -496,13 +527,13 @@ def test_best_checkpoint_preview_uses_best_and_preserves_live_module(
     assert len(experiment.calls) == 1
     payload, step = experiment.calls[0]
     assert set(payload) == {
-        "media/best_inputs",
-        "media/best_reconstruction",
+        "best/synthetic/media/inputs",
+        "best/synthetic/media/reconstruction",
         "trainer/global_step",
     }
     assert step is None
     assert payload["trainer/global_step"] == 7
-    reconstruction = payload["media/best_reconstruction"]
+    reconstruction = payload["best/synthetic/media/reconstruction"]
     assert isinstance(reconstruction, _FakeImage)
     assert np.isclose(reconstruction.data[:, 32:48], 0.1).any()
     assert not np.isclose(reconstruction.data[:, 32:48], 0.9).any()
@@ -566,8 +597,8 @@ def test_best_checkpoint_preview_uses_sample_from_non_periodic_epoch(
     assert len(experiment.calls) == 1
     payload, _ = experiment.calls[0]
     assert set(payload) == {
-        "media/best_inputs",
-        "media/best_reconstruction",
+        "best/synthetic/media/inputs",
+        "best/synthetic/media/reconstruction",
         "trainer/global_step",
     }
 
@@ -590,10 +621,10 @@ def test_media_callback_uses_lightning_logger_without_explicit_wandb_steps(
     callback.on_fit_end(trainer, module)
 
     assert {
-        "media/validation_inputs",
-        "media/validation_reconstruction",
-        "media/best_inputs",
-        "media/best_reconstruction",
+        "val/synthetic/media/inputs",
+        "val/synthetic/media/reconstruction",
+        "best/synthetic/media/inputs",
+        "best/synthetic/media/reconstruction",
     } <= experiment.history.keys()
     assert experiment.explicit_steps == []
     assert experiment.finished is False
@@ -684,7 +715,7 @@ def test_best_checkpoint_preview_loads_real_lightning_checkpoint(
     callback.on_fit_end(trainer, module)
 
     payload, step = experiment.calls[0]
-    assert set(payload) >= {"media/best_inputs", "media/best_reconstruction"}
+    assert set(payload) >= {"best/synthetic/media/inputs", "best/synthetic/media/reconstruction"}
     assert step is None
 
 
@@ -1049,7 +1080,7 @@ def test_run_identity_does_not_log_checkpoint_paths() -> None:
     assert "/private" not in json.dumps(identity.tags)
 
 
-def test_metric_name_omits_dataset_for_non_probe_stages() -> None:
+def test_metric_name_omits_absent_dataset() -> None:
     assert metric_name("pretrain", "loss") == "pretrain/loss"
 
 

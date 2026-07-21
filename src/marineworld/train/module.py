@@ -10,6 +10,7 @@ import torch
 from pytorch_lightning import LightningModule
 
 from marineworld.models.videomae import build_videomae, tube_mask
+from marineworld.train.naming import metric_name
 
 __all__ = ["VideoMAEPretrainingModule"]
 
@@ -59,7 +60,7 @@ class VideoMAEPretrainingModule(LightningModule):
     def training_step(self, batch: Mapping[str, Any], batch_idx: int) -> torch.Tensor:
         loss = self._reconstruction_loss(batch, batch_idx, stage="training")
         self.log(
-            "pretrain/loss",
+            metric_name("pretrain", "loss"),
             loss,
             on_step=True,
             on_epoch=True,
@@ -71,7 +72,7 @@ class VideoMAEPretrainingModule(LightningModule):
     def validation_step(self, batch: Mapping[str, Any], batch_idx: int) -> torch.Tensor:
         loss = self._reconstruction_loss(batch, batch_idx, stage="validation")
         self.log(
-            "val/loss",
+            metric_name("val", "loss"),
             loss,
             on_step=False,
             on_epoch=True,

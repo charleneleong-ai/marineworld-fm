@@ -115,11 +115,6 @@ def build_wandb_logger(cfg: DictConfig, identity: RunIdentity) -> WandbLogger | 
     )
 
 
-def metric_name(stage: str, metric: str, dataset: str | None = None) -> str:
-    """Return a slash-separated metric name in the shared namespace."""
-    return "/".join(part for part in (stage, dataset, metric) if part)
-
-
 def _create_wandb_logger(**kwargs: Any) -> WandbLogger:
     """Import Lightning lazily so disabled tracking has no W&B import side effects."""
     from pytorch_lightning.loggers import WandbLogger
