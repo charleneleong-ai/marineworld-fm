@@ -86,6 +86,15 @@ def _serialize_record(record: VideoRecord) -> dict[str, object]:
     }
 
 
+def content_identity(path: Path) -> str | None:
+    """Return a content digest tag for an existing file or directory, else None."""
+    if path.is_file():
+        return f"sha256:{file_checksum(path)}"
+    if path.is_dir():
+        return f"sha256-directory:{directory_checksum(path)}"
+    return None
+
+
 def file_checksum(path: Path) -> str:
     """Return a content digest that is independent of the file's local path."""
     canonical = _canonical_path(path)
@@ -108,9 +117,13 @@ def directory_checksum(root: Path) -> str:
     return digest.hexdigest()
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=None)
 def cached_file_checksum(path: Path, size: int, modified_ns: int) -> str:
-    """Cache content digests while file size and modification time are unchanged."""
+    """Cache content digests while file size and modification time are unchanged.
+
+    Unbounded because the working set is one entry per corpus file: a fixed bound
+    thrashes, since manifests are rescanned in the same sorted order every pass.
+    """
     del size, modified_ns
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()

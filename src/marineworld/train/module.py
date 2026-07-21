@@ -26,6 +26,7 @@ class VideoMAEPretrainingModule(LightningModule):
         weight_decay: float = 0.05,
         warmup_epochs: int = 0,
         max_epochs: int = 1,
+        total_steps: int | None = None,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -35,6 +36,7 @@ class VideoMAEPretrainingModule(LightningModule):
         self.weight_decay = weight_decay
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+        self.total_steps = total_steps
         self.mask_ratio = float(self.model_config["mask_ratio"])
         self.seed = int(self.model_config.get("seed", 42) if seed is None else seed)
 
@@ -94,13 +96,20 @@ class VideoMAEPretrainingModule(LightningModule):
             raise FloatingPointError(f"non-finite {stage} loss at batch {batch_idx}")
         return loss
 
+    def _schedule_length(self) -> int:
+        """Total optimizer steps the cosine schedule spans."""
+        if self.total_steps is not None:
+            return self.total_steps
+        trainer = getattr(self, "_trainer", None)
+        if trainer is None:
+            raise RuntimeError(
+                "cosine schedule needs a step budget: attach a Trainer or pass total_steps"
+            )
+        return int(trainer.estimated_stepping_batches)
+
     def configure_optimizers(self) -> dict[str, Any]:
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        trainer = getattr(self, "_trainer", None)
-        total_steps = max(
-            1,
-            int(trainer.estimated_stepping_batches) if trainer is not None else self.max_epochs * 2,
-        )
+        total_steps = max(1, self._schedule_length())
         warmup_steps = round(total_steps * self.warmup_epochs / max(1, self.max_epochs))
 
         def scale(step: int) -> float:

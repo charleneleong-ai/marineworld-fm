@@ -25,7 +25,7 @@ from marineworld.data.clips import (
     SyntheticVideoDecoder,
 )
 from marineworld.data.contracts import DatasetManifest, FrameTargets
-from marineworld.data.manifest import manifest_checksum, validate_manifest
+from marineworld.data.manifest import content_identity, manifest_checksum, validate_manifest
 from marineworld.data.splits import SplitUnavailableError, prepare_manifest_splits
 from marineworld.eval.encoders import (
     EncoderFeatures,
@@ -998,28 +998,11 @@ def _count_bin(count: int) -> int:
 
 
 def _checkpoint_identity(checkpoint: str, revision: str | None = None) -> str:
+    """Identify a checkpoint by content, falling back to its reference."""
     path = Path(checkpoint).expanduser()
-    if path.is_dir():
-        digest = hashlib.sha256()
-        files = sorted(candidate for candidate in path.rglob("*") if candidate.is_file())
-        for file in files:
-            relative_path = file.relative_to(path).as_posix().encode()
-            digest.update(len(relative_path).to_bytes(8, "big"))
-            digest.update(relative_path)
-            digest.update(file.stat().st_size.to_bytes(8, "big"))
-            _update_digest_from_file(digest, file)
-        return f"sha256-tree:{digest.hexdigest()}"
-    if not path.is_file():
-        return f"{checkpoint}@{revision}" if revision else checkpoint
-    digest = hashlib.sha256()
-    _update_digest_from_file(digest, path)
-    return f"sha256:{digest.hexdigest()}"
-
-
-def _update_digest_from_file(digest: Any, path: Path) -> None:
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    if (identity := content_identity(path)) is not None:
+        return identity
+    return f"{checkpoint}@{revision}" if revision else checkpoint
 
 
 def _wandb_table(table: Any) -> Any:

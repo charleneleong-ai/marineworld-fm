@@ -2054,7 +2054,7 @@ def test_local_huggingface_directory_identity_hashes_recursive_contents(
     weights.write_bytes(b"weights-v2")
     weights_changed = _checkpoint_identity(str(checkpoint))
 
-    assert initial.startswith("sha256-tree:")
+    assert initial.startswith("sha256-directory:")
     assert len({initial, config_changed, weights_changed}) == 3
 
 

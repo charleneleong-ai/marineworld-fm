@@ -123,6 +123,7 @@ def build_clip_index(
     frames: int,
     stride: int,
     seed: int,
+    fingerprint: str | None = None,
 ) -> tuple[ClipIndex, ...]:
     """Build deterministic non-overlapping clips from videos in one split."""
     validate_manifest(manifest)
@@ -132,7 +133,7 @@ def build_clip_index(
         raise ValueError("stride must be positive")
 
     span = 1 + (frames - 1) * stride
-    fingerprint = manifest_checksum(manifest)
+    fingerprint = manifest_checksum(manifest) if fingerprint is None else fingerprint
     records = sorted(
         (record for record in manifest.records if record.split == split),
         key=lambda record: _record_order_key(record, fingerprint, seed),
@@ -170,12 +171,13 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         normalization_mean: tuple[float, float, float] | None = None,
         normalization_std: tuple[float, float, float] | None = None,
         color_jitter: float = 0.0,
+        fingerprint: str | None = None,
     ) -> None:
         if image_size is not None and image_size <= 0:
             raise ValueError("image_size must be positive")
         self.records = {record.id: record for record in manifest.records if record.split == split}
         self.clips = build_clip_index(
-            manifest, split=split, frames=frames, stride=stride, seed=seed
+            manifest, split=split, frames=frames, stride=stride, seed=seed, fingerprint=fingerprint
         )
         self.decoder = decoder
         self.image_size = image_size
