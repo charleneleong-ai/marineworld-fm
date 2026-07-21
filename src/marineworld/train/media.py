@@ -15,6 +15,7 @@ from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
 from marineworld.train.module import VideoMAEPretrainingModule
+from marineworld.train.naming import metric_name
 
 __all__ = ["MediaPreview", "WandbMediaCallback", "build_media_preview"]
 
@@ -26,6 +27,7 @@ class MediaPreview:
     input_grid: np.ndarray
     reconstruction_panel: np.ndarray
     caption: str
+    dataset: str
 
 
 class WandbMediaCallback(Callback):
@@ -59,7 +61,7 @@ class WandbMediaCallback(Callback):
         dataloader_idx: int = 0,
     ) -> None:
         del outputs
-        logger = self._validation_logger(trainer, batch_idx, dataloader_idx)
+        logger = self._preview_logger(trainer, batch_idx, dataloader_idx)
         if logger is None:
             return
         if not isinstance(pl_module, VideoMAEPretrainingModule):
@@ -69,17 +71,9 @@ class WandbMediaCallback(Callback):
         self._sample = _first_sample(batch)
         if trainer.current_epoch % self.every_n_epochs != 0:
             return
-        preview = _preview_from_module(
-            pl_module,
-            self._sample,
-            step=trainer.global_step,
-            microbatch=batch_idx,
-            mean=self.mean,
-            std=self.std,
-            max_frames=self.max_frames,
+        self._emit(
+            logger, pl_module, self._sample, stage="val", trainer=trainer, microbatch=batch_idx
         )
-        if preview is not None:
-            _log_preview(logger, preview, "validation", trainer.global_step)
 
     def on_fit_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         sample, self._sample = self._sample, None
@@ -104,22 +98,61 @@ class WandbMediaCallback(Callback):
         restored = _restore_module(pl_module, Path(best_model_path))
         if restored is None:
             return
+        self._emit(logger, restored, sample, stage="best", trainer=trainer, microbatch=0)
+
+    def on_train_batch_end(
+        self,
+        trainer: Trainer,
+        pl_module: LightningModule,
+        outputs: Any,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+    ) -> None:
+        """Preview the live train reconstruction so it can be read against validation."""
+        del outputs
+        logger = self._preview_logger(trainer, batch_idx)
+        if logger is None or trainer.current_epoch % self.every_n_epochs != 0:
+            return
+        if not isinstance(pl_module, VideoMAEPretrainingModule):
+            warnings.warn("media preview requires a VideoMAE pretraining module", stacklevel=2)
+            return
+
+        self._emit(
+            logger,
+            pl_module,
+            _first_sample(batch, to_cpu=False),
+            stage="pretrain",
+            trainer=trainer,
+            microbatch=batch_idx,
+        )
+
+    def _emit(
+        self,
+        logger: Any,
+        module: VideoMAEPretrainingModule,
+        sample: Mapping[str, Any],
+        *,
+        stage: str,
+        trainer: Trainer,
+        microbatch: int,
+    ) -> None:
+        """Render one preview and log it under the given stage."""
         preview = _preview_from_module(
-            restored,
+            module,
             sample,
             step=trainer.global_step,
-            microbatch=0,
+            microbatch=microbatch,
             mean=self.mean,
             std=self.std,
             max_frames=self.max_frames,
         )
         if preview is not None:
-            _log_preview(logger, preview, "best", trainer.global_step)
+            _log_preview(logger, preview, stage, trainer.global_step)
 
-    def _validation_logger(
-        self, trainer: Trainer, batch_idx: int, dataloader_idx: int
+    def _preview_logger(
+        self, trainer: Trainer, batch_idx: int, dataloader_idx: int = 0
     ) -> Any | None:
-        if not self.enabled or trainer.global_rank != 0 or batch_idx != 0 or dataloader_idx != 0:
+        if batch_idx != 0 or dataloader_idx != 0 or not self.enabled or trainer.global_rank != 0:
             return None
         return _wandb_logger(trainer.logger)
 
@@ -134,9 +167,11 @@ def _wandb_logger(logger: object) -> Any | None:
     return logger if callable(getattr(logger, "log_metrics", None)) else None
 
 
-def _first_sample(batch: Mapping[str, Any]) -> dict[str, Any]:
+def _first_sample(batch: Mapping[str, Any], *, to_cpu: bool = True) -> dict[str, Any]:
+    """Copy the first clip; retained samples go to CPU, inline ones stay on device."""
+    pixel_values = batch["pixel_values"][:1].detach()
     return {
-        "pixel_values": batch["pixel_values"][:1].detach().cpu().clone(),
+        "pixel_values": pixel_values.cpu().clone() if to_cpu else pixel_values,
         "dataset": _first_metadata(batch, "dataset"),
         "source": _first_metadata(batch, "source"),
     }
@@ -163,8 +198,13 @@ def _preview_from_module(
     mask = module.make_mask(
         pixel_values.shape[0], pixel_values.device, step=step, microbatch=microbatch
     )
-    with torch.inference_mode():
-        logits = module.model(pixel_values=pixel_values, bool_masked_pos=mask).logits
+    was_training = module.training
+    module.eval()
+    try:
+        with torch.inference_mode():
+            logits = module.model(pixel_values=pixel_values, bool_masked_pos=mask).logits
+    finally:
+        module.train(was_training)
     if logits is None:
         warnings.warn(
             "media preview skipped: model returned no reconstruction logits", stacklevel=2
@@ -232,13 +272,16 @@ def _restore_module(
     return restored
 
 
-def _log_preview(logger: Any, preview: MediaPreview, namespace: str, step: int) -> None:
+def _log_preview(logger: Any, preview: MediaPreview, stage: str, step: int) -> None:
+    """Log previews under the stage that produced them, split per dataset."""
     import wandb
 
     logger.log_metrics(
         {
-            f"media/{namespace}_inputs": wandb.Image(preview.input_grid, caption=preview.caption),
-            f"media/{namespace}_reconstruction": wandb.Image(
+            metric_name(stage, "media/inputs", preview.dataset): wandb.Image(
+                preview.input_grid, caption=preview.caption
+            ),
+            metric_name(stage, "media/reconstruction", preview.dataset): wandb.Image(
                 preview.reconstruction_panel, caption=preview.caption
             ),
         },
@@ -283,7 +326,7 @@ def build_media_preview(
         (originals, masked[0, indices], completed[0, indices], error[0, indices]), dim=-1
     )
     panel = _to_hwc(torch.cat(tuple(rows), dim=-2))
-    return MediaPreview(input_grid, panel, f"dataset={dataset} source={source}")
+    return MediaPreview(input_grid, panel, f"dataset={dataset} source={source}", dataset)
 
 
 def _validate_preview_config(
