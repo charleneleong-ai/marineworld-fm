@@ -1604,6 +1604,29 @@ def test_masks_are_unique_per_accumulated_microbatch() -> None:
     assert not torch.equal(first, second)
 
 
+def test_training_logs_lr_and_grad_norm_under_the_pretrain_stage(
+    tmp_path: Path, tiny_batch: dict[str, torch.Tensor]
+) -> None:
+    """The cosine schedule is only observable if the LR it produces is logged."""
+    logged: dict[str, float] = {}
+    module = VideoMAEPretrainingModule(_tiny_model_config(), warmup_epochs=0, max_epochs=1)
+    module.log = lambda name, value, **_: logged.__setitem__(name, float(value))  # type: ignore[method-assign]
+    trainer = Trainer(
+        max_steps=1,
+        limit_train_batches=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        accelerator="cpu",
+        default_root_dir=str(tmp_path),
+    )
+
+    trainer.fit(module, train_dataloaders=DataLoader([tiny_batch], batch_size=None))
+
+    assert logged["pretrain/lr"] > 0
+    assert logged["pretrain/grad_norm"] > 0
+
+
 def test_scheduler_without_trainer_requires_an_explicit_step_budget() -> None:
     module = VideoMAEPretrainingModule(_tiny_model_config(), warmup_epochs=1, max_epochs=4)
 
