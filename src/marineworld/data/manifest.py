@@ -8,7 +8,9 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
-from marineworld.data.contracts import DatasetManifest, VideoRecord
+import numpy as np
+
+from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 
 _SPLITS = frozenset({"train", "val", "test"})
 
@@ -55,6 +57,11 @@ def manifest_checksum(manifest: DatasetManifest) -> str:
         "name": manifest.name,
         "version": manifest.version,
         "license": manifest.license,
+        "access": manifest.access,
+        "label_mapping": dict(manifest.label_mapping),
+        "native_labels": sorted(manifest.native_labels),
+        "component_checksums": dict(manifest.component_checksums),
+        "components": dict(manifest.components),
         "records": [
             _serialize_record(record) for record in sorted(manifest.records, key=lambda r: r.id)
         ],
@@ -107,3 +114,47 @@ def cached_file_checksum(path: Path, size: int, modified_ns: int) -> str:
     del size, modified_ns
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def validate_frame_targets(
+    record: VideoRecord,
+    targets: tuple[FrameTargets, ...],
+    *,
+    source_size: tuple[int, int],
+) -> None:
+    """Validate canonical annotations against video length and source geometry."""
+    height, width = source_size
+    if height <= 0 or width <= 0:
+        raise ValueError("source dimensions must be positive")
+    seen: set[int] = set()
+    for target in targets:
+        if target.frame_index in seen or not 0 <= target.frame_index < record.num_frames:
+            raise ValueError(f"record {record.id}: frame index is duplicate or out of range")
+        seen.add(target.frame_index)
+        boxes = np.asarray(target.boxes_xyxy)
+        classes = np.asarray(target.class_ids)
+        tracks = None if target.track_ids is None else np.asarray(target.track_ids)
+        if boxes.ndim != 2 or boxes.shape[1:] != (4,):
+            raise ValueError(f"record {record.id}: boxes must be shaped [N, 4]")
+        if classes.ndim != 1 or len(classes) != len(boxes):
+            raise ValueError(f"record {record.id}: box and class lengths must align")
+        if not np.issubdtype(classes.dtype, np.integer) or not np.isfinite(classes).all():
+            raise ValueError(f"record {record.id}: class IDs must be finite integers")
+        if np.any(classes < 0):
+            raise ValueError(f"record {record.id}: class IDs must be non-negative")
+        if tracks is not None and (tracks.ndim != 1 or len(tracks) != len(boxes)):
+            raise ValueError(f"record {record.id}: box and track lengths must align")
+        if tracks is not None and (
+            not np.issubdtype(tracks.dtype, np.integer) or not np.isfinite(tracks).all()
+        ):
+            raise ValueError(f"record {record.id}: track IDs must be finite integers")
+        if not np.isfinite(boxes).all():
+            raise ValueError(f"record {record.id}: boxes must be finite")
+        if np.any(boxes[:, 2:] <= boxes[:, :2]):
+            raise ValueError(f"record {record.id}: boxes must have positive area")
+        if (
+            np.any(boxes < 0)
+            or np.any(boxes[:, (0, 2)] > width)
+            or np.any(boxes[:, (1, 3)] > height)
+        ):
+            raise ValueError(f"record {record.id}: boxes exceed source bounds")

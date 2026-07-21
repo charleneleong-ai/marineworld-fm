@@ -1,0 +1,17 @@
+# Tiny random negative control for local frozen-probe smoke tests.
+name: videomae_tiny
+condition: random
+backbone: tiny
+image_size: 16
+patch_size: 8
+num_frames: 4
+tubelet_size: 2
+hidden_size: 32
+num_hidden_layers: 1
+num_attention_heads: 4
+intermediate_size: 64
+decoder_hidden_size: 16
+decoder_num_hidden_layers: 1
+decoder_num_attention_heads: 4
+decoder_intermediate_size: 32
+mask_ratio: 0.5

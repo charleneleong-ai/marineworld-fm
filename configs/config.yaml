@@ -6,6 +6,7 @@ defaults:
   - train: pretrain
   - runtime: local_smoke
   - tracking: wandb
+  - optional eval: null
   - _self_
 
 seed: 42
