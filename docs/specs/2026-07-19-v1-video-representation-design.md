@@ -79,6 +79,16 @@ class FrameTargets:
     track_ids: Tensor | None
 
 
+@dataclass(frozen=True)
+class SpatialTransform:
+    source_size: tuple[int, int]
+    output_size: tuple[int, int]
+    scale: tuple[float, float]
+    offset: tuple[float, float]
+
+    def apply_boxes_xyxy(self, boxes: ndarray) -> ndarray: ...
+
+
 class DatasetAdapter(Protocol):
     def build_manifest(self, root: Path) -> DatasetManifest: ...
     def load_targets(self, record: VideoRecord) -> Sequence[FrameTargets]: ...
@@ -86,7 +96,12 @@ class DatasetAdapter(Protocol):
 
 `DatasetManifest` includes dataset name and version, licence/access metadata, canonical label mapping, native labels, records, and a deterministic content checksum. Validation rejects duplicate record IDs, missing media, invalid splits, non-positive frame metadata, targets outside frame bounds, and video overlap across splits.
 
-`MaritimeClipDataset` consumes manifests rather than concrete adapters. It returns a fixed-shape video tensor, temporal indices, record identity, and optional frame targets. Adapters register through Hydra `_target_` configuration rather than a central conditional.
+`MaritimeClipDataset` consumes manifests rather than concrete adapters. Before resizing decoded
+frames, it derives a typed `SpatialTransform` from the source height/width to the output canvas.
+Each sample returns that transform alongside the fixed-shape video tensor, temporal indices,
+record identity, and optional frame targets. Scale and offset are explicit so box geometry remains
+correct for non-square sources and can support future crop transforms; v1 resize has zero offsets.
+Adapters register through Hydra `_target_` configuration rather than a central conditional.
 
 Future modalities attach as optional typed sidecars:
 
@@ -108,6 +123,12 @@ Sidecars may add data but may not change the core video or target contract.
 - Preserve dataset and source identity for stratified metrics.
 - Keep augmentation stochasticity separate from deterministic clip membership.
 - Record every split and label-subsample selection as a manifest artifact.
+- Parse SMD supervision only through the explicit native `smd_objectgt_mat` contract:
+  `ObjectGT/<video_stem>_ObjectGT.mat`, one `structXML` element per zero-based frame,
+  `BB` rows in `x, y, width, height` form, and matching `Object` class rows. Retain
+  vessel classes 1 and 3--7, preserve empty annotated frames, filter invalid class 0,
+  buoy class 2, and non-vessel/other classes 8--10, and fail on unmatched filenames
+  or malformed/unsupported MAT schemas.
 
 ## Evaluation
 
@@ -115,7 +136,11 @@ Frozen encoders are evaluated with lightweight, separately trained probes:
 
 - Dataset-native class prediction where class labels exist.
 - Vessel-count-bin prediction from frame targets.
-- A low-capacity dense detection probe over frozen spatial tokens.
+- A single-linear-layer binary vessel-occupancy probe over frozen spatial tokens. Source-pixel
+  boxes are mapped through the sample's `SpatialTransform`, then rasterized onto the encoder's
+  temporal/spatial token grid before probe fitting. Dense feature extraction, head updates, and
+  confusion-count evaluation stream clip minibatches; the full dense feature corpus is never
+  retained in memory.
 - Nearest-neighbour retrieval and reconstruction diagnostics.
 
 Each supervised probe uses 1%, 5%, 10%, and 100% of labelled training videos with three deterministic subsampling seeds. Metrics follow the dataset's native task and are never averaged across incompatible taxonomies. External encoders use the closest supported spatial and temporal resolution; deviations are logged explicitly.
@@ -162,7 +187,13 @@ All training and probe entrypoints construct logging through one experiment fact
 - Interrupted training preserves the last checkpoint; continuation starts a linked W&B
   attempt rather than reopening the interrupted run.
 - Non-finite loss terminates the run, records the failing batch metadata without raw frames, and preserves the checkpoint.
-- Probe results are emitted only when the encoder checkpoint, manifest checksum, split, and label subset are all known.
+- SMD and FVessel classification, count, and dense probes are executable from their
+  native annotations; representative SMD fixtures cover boxes, empty frames, class
+  filtering, filename pairing, and malformed rows.
+- Probe results are emitted only when the encoder checkpoint, manifest checksum, split,
+  and label subset are all known. Resource and degeneracy skips retain any computable
+  deterministic label subset, and W&B receives the split/subsample JSON as a dataset
+  artifact (with the same file retained under `output_dir` when tracking is disabled).
 
 ## Test strategy
 

@@ -47,7 +47,15 @@ class FVesselAdapter:
 
     def build_manifest(self, root: Path) -> DatasetManifest:
         records = tuple(self._record(root, video) for video in sorted(root.rglob("*.mp4")))
-        return DatasetManifest("fvessel", self.version, "MIT", records)
+        return DatasetManifest(
+            "fvessel",
+            self.version,
+            "MIT",
+            records,
+            access="public",
+            label_mapping={"1": "vessel"},
+            native_labels=("MOT class_id", "AIS MMSI"),
+        )
 
     def load_targets(self, record: VideoRecord) -> tuple[FrameTargets, ...]:
         if record.annotation_path is None:
@@ -55,11 +63,20 @@ class FVesselAdapter:
 
         frames: dict[int, list[tuple[list[float], int, int]]] = {}
         with record.annotation_path.open(newline="") as handle:
-            for row in csv.reader(handle):
+            for row_number, row in enumerate(csv.reader(handle), start=1):
                 if len(row) < 8:
-                    continue
+                    raise ValueError(
+                        f"FVessel MOT row {row_number} in {record.annotation_path} "
+                        f"must contain at least 8 columns"
+                    )
                 frame, track_id, left, top, width, height, _, class_id = row[:8]
-                frame_index = int(float(frame)) - 1
+                frame_index = _non_negative_integer(frame, "frame", record.annotation_path) - 1
+                if frame_index < 0:
+                    raise ValueError(
+                        f"FVessel frame ID in {record.annotation_path} must be a positive integer"
+                    )
+                parsed_track_id = _non_negative_integer(track_id, "track", record.annotation_path)
+                parsed_class_id = _non_negative_integer(class_id, "class", record.annotation_path)
                 frames.setdefault(frame_index, []).append(
                     (
                         [
@@ -68,8 +85,8 @@ class FVesselAdapter:
                             float(left) + float(width),
                             float(top) + float(height),
                         ],
-                        int(float(class_id)),
-                        int(float(track_id)),
+                        parsed_class_id,
+                        parsed_track_id,
                     )
                 )
 
@@ -108,6 +125,18 @@ class FVesselAdapter:
         if count <= 0:
             raise ValueError(f"FVessel frame count must be positive, got {count}")
         return count
+
+
+def _non_negative_integer(value: str, field: str, path: Path) -> int:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(
+            f"FVessel {field} ID in {path} must be a finite non-negative integer"
+        ) from error
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        raise ValueError(f"FVessel {field} ID in {path} must be a finite non-negative integer")
+    return int(parsed)
 
 
 def _mot_path(sample_root: Path) -> Path | None:

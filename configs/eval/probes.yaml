@@ -1,0 +1,12 @@
+task: classification
+label_fractions: [0.01, 0.05, 0.1, 1.0]
+seeds: [40, 41, 42]
+checkpoint: null
+device: cpu
+batch_size: 8
+dense_epochs: 5
+dense_lr: 0.1
+allow_download: false
+optional: false
+# Enable only after selecting one condition/fraction/seed on validation.
+report_test: false

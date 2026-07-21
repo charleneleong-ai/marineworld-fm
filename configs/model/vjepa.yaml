@@ -1,0 +1,6 @@
+name: vjepa2_vitl_fpc64_256
+condition: vjepa
+checkpoint: facebook/vjepa2-vitl-fpc64-256
+revision: b3c1679b7c34d3255ef3547f27c7b226aefab26f
+image_size: 256
+num_frames: 64

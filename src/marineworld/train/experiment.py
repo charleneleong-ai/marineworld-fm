@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -61,7 +62,7 @@ def build_run_identity(
     git_sha: str | None = None,
     accelerator: str | None = None,
     checkpoint_provenance: str | None = None,
-    scientific_config: dict[str, Any] | None = None,
+    logical_dimensions: Mapping[str, Any] | None = None,
 ) -> RunIdentity:
     """Build a portable condition fingerprint and a unique execution attempt ID."""
     condition = {
@@ -69,7 +70,7 @@ def build_run_identity(
         "manifest_checksums": sorted(manifest_checksums),
         "model": model,
         "seed": seed,
-        "scientific_config": scientific_config or {},
+        "logical_dimensions": dict(logical_dimensions or {}),
     }
     payload = json.dumps(condition, sort_keys=True, separators=(",", ":"))
     condition_id = hashlib.sha256(payload.encode()).hexdigest()[:16]
