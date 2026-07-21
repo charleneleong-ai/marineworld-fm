@@ -7,36 +7,132 @@ PYTHONDONTWRITEBYTECODE = "1"
 [tools]
 python = "3.13.7"
 
-[tasks]
-# Install development dependencies (core + train + dev).
-"setup" = "pip install -e '.[train,dev]'"
+[tasks.setup]
+description = "Install the locked environment (core + train + dev)."
+run = "uv sync --all-extras"
 
-# Run all tests.
-"test" = "pytest -v tests/"
+# --- Quality -----------------------------------------------------------------
 
-# Run linting and formatting checks.
-"lint" = "ruff check src/ tests/ --select E,W,F,I"
-"format" = "ruff format src/ tests/"
-"format:check" = "ruff format --check src/ tests/"
+[tasks.test]
+description = "Run the full test suite."
+run = "uv run pytest -q"
 
-# Quick check: seed util import + alignment tests only.
-"check:alignment" = "pytest -v tests/test_alignment.py"
+[tasks."test:fail-fast"]
+description = "Run tests, stopping at the first failure."
+run = "uv run pytest -x -q"
 
-# Run tests with verbose output and stop on first failure.
-"test:fail-fast" = "pytest -v -x tests/"
+[tasks."test:alignment"]
+description = "Run the AIS/video temporal alignment tests only."
+run = "uv run pytest -v tests/test_alignment.py"
 
-# End-to-end synthetic VideoMAE smoke with local-only W&B logging.
-"smoke" = "WANDB_MODE=offline uv run --extra train python -m marineworld.train.pretrain data=synthetic model=videomae_tiny runtime=local_smoke"
+[tasks.lint]
+description = "Lint sources and tests."
+run = "uv run ruff check src/ tests/"
 
-# Bounded real FVessel decoder/training smoke with online scalar logging.
-"smoke:fvessel" = "test -n \"$MARINEWORLD_DATA_ROOT\" && WANDB_MODE=online uv run --extra train python -m marineworld.train.pretrain data=fvessel model=videomae_tiny runtime=real_smoke data.root=\"$MARINEWORLD_DATA_ROOT\""
+[tasks."lint:fix"]
+description = "Lint and apply safe fixes."
+run = "uv run ruff check --fix src/ tests/"
 
-# Single-GPU runs require an explicit real-data root.
-"train:l4" = "test -n \"$MARINEWORLD_DATA_ROOT\" && WANDB_MODE=online uv run --extra train python -m marineworld.train.pretrain runtime=l4 data.root=\"$MARINEWORLD_DATA_ROOT\""
-"train:a100" = "test -n \"$MARINEWORLD_DATA_ROOT\" && WANDB_MODE=online uv run --extra train python -m marineworld.train.pretrain runtime=a100 data.root=\"$MARINEWORLD_DATA_ROOT\""
+[tasks.format]
+description = "Format sources and tests."
+run = "uv run ruff format src/ tests/"
 
-# Download and safely extract the official 2.56 GB FVessel Clip-10 subset.
-"download:fvessel-clip10" = "uv run --extra train python -m marineworld.data.download fvessel-clip10 --output data/raw/fvessel"
+[tasks."format:check"]
+description = "Check formatting without writing."
+run = "uv run ruff format --check src/ tests/"
 
-# Show available tasks.
-"help" = "mise tasks --no-header"
+[tasks.hooks]
+description = "Run every pre-commit hook over the whole tree."
+run = "uv run pre-commit run --all-files"
+
+[tasks.ci]
+description = "Everything CI enforces: lint, format check, tests."
+depends = ["lint", "format:check", "test"]
+
+# --- Data --------------------------------------------------------------------
+
+[tasks."download:fvessel-clip10"]
+description = "Download and safely extract the official 2.56 GB FVessel Clip-10 subset."
+run = "uv run python -m marineworld.data.download fvessel-clip10 --output data/raw/fvessel"
+
+# --- Pretraining -------------------------------------------------------------
+# Real-data tasks require MARINEWORLD_DATA_ROOT so a restricted corpus path is
+# never baked into a committed config.
+
+[tasks.smoke]
+description = "Offline synthetic VideoMAE smoke. No data or W&B account needed."
+run = """
+WANDB_MODE=offline uv run python -m marineworld.train.pretrain \
+  data=synthetic model=videomae_tiny runtime=local_smoke
+"""
+
+[tasks."smoke:joint"]
+description = "Offline smoke over the balanced joint synthetic corpus."
+run = """
+WANDB_MODE=offline uv run python -m marineworld.train.pretrain \
+  data=joint_synthetic model=videomae_tiny runtime=local_smoke
+"""
+
+[tasks."smoke:fvessel"]
+description = "Bounded real FVessel decode/train smoke with online tracking."
+run = """
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+WANDB_MODE=online uv run python -m marineworld.train.pretrain \
+  data=fvessel model=videomae_vit_small runtime=real_smoke \
+  data.root="$MARINEWORLD_DATA_ROOT"
+"""
+
+[tasks."train:l4"]
+description = "Full single-L4 pretraining run."
+run = """
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+WANDB_MODE=online uv run python -m marineworld.train.pretrain \
+  runtime=l4 data.root="$MARINEWORLD_DATA_ROOT"
+"""
+
+[tasks."train:a100"]
+description = "Full single-A100 pretraining run."
+run = """
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+WANDB_MODE=online uv run python -m marineworld.train.pretrain \
+  runtime=a100 data.root="$MARINEWORLD_DATA_ROOT"
+"""
+
+[tasks."train:joint"]
+description = "Full A100 run over the balanced SMD + FVessel joint corpus."
+run = """
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+WANDB_MODE=online uv run python -m marineworld.train.pretrain \
+  data=joint runtime=a100 data.root="$MARINEWORLD_DATA_ROOT"
+"""
+
+# --- Representation evaluation ------------------------------------------------
+
+[tasks."eval:probes"]
+description = "Frozen-encoder linear probes over label fractions and seeds."
+run = """
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+WANDB_MODE=online uv run python -m marineworld.eval.run_probes \
+  eval=probes model=maritime_videomae data.root="$MARINEWORLD_DATA_ROOT"
+"""
+
+[tasks."eval:probes-smoke"]
+description = "Offline probe smoke on synthetic data; skips cleanly if no encoder."
+run = """
+WANDB_MODE=offline uv run python -m marineworld.eval.run_probes \
+  eval=probes model=random data=synthetic runtime=local_smoke \
+  eval.optional=true eval.label_fractions=[1.0] eval.seeds=[42]
+"""
+
+[tasks."eval:probes-checkpoint"]
+description = "Probe a specific checkpoint: mise run eval:probes-checkpoint -- <path>"
+run = """
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+WANDB_MODE=online uv run python -m marineworld.eval.run_probes \
+  eval=probes model=maritime_videomae data.root="$MARINEWORLD_DATA_ROOT" \
+  eval.checkpoint="$1"
+"""
+
+[tasks.help]
+description = "Show available tasks."
+run = "mise tasks --no-header"
