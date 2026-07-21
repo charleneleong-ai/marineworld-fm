@@ -73,8 +73,15 @@ class BalancedDatasetSampler(Sampler[int]):
             for name in sorted(set(dataset_ids))
         }
         configured = dict(weights or {name: 1.0 for name in self.groups})
-        if set(configured) != set(self.groups) or any(value <= 0 for value in configured.values()):
-            raise ValueError("sampler weights must be positive and cover every dataset")
+        if absent := sorted(set(configured) - set(self.groups)):
+            raise ValueError(
+                f"sampler weights name dataset(s) absent from the corpus: {', '.join(absent)}. "
+                f"Present: {', '.join(sorted(self.groups)) or 'none'}."
+            )
+        if unweighted := sorted(set(self.groups) - set(configured)):
+            raise ValueError(f"sampler weights omit dataset(s): {', '.join(unweighted)}")
+        if nonpositive := sorted(name for name, value in configured.items() if value <= 0):
+            raise ValueError(f"sampler weights must be positive: {', '.join(nonpositive)}")
         total = sum(configured.values())
         self.weights = {name: value / total for name, value in configured.items()}
         self.seed = seed

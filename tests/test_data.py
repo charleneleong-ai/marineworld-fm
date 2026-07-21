@@ -252,6 +252,22 @@ def test_clip_dataset_validates_targets_outside_current_clip(tmp_path: Path) -> 
         dataset[0]
 
 
+def test_composite_adapter_names_the_component_that_resolved_to_nothing(tmp_path: Path) -> None:
+    """A missing component must not silently degrade the mixture to a smaller corpus."""
+    adapter = CompositeAdapter(
+        components={
+            "smd": SMDAdapter(version="fixture", num_frames=4),
+            "fvessel": SyntheticAdapter(version="one", num_videos=1, num_frames=4),
+        },
+        roots={"smd": tmp_path / "missing-smd", "fvessel": tmp_path / "fvessel"},
+    )
+
+    with pytest.raises(ValueError, match=r"zero videos.*smd at .*missing-smd") as caught:
+        adapter.build_manifest(tmp_path)
+
+    assert "fvessel" not in str(caught.value)
+
+
 def test_composite_adapter_preserves_dataset_identity_and_provenance(tmp_path: Path) -> None:
     first = SyntheticAdapter(version="one", num_videos=1, num_frames=4)
     second = SyntheticAdapter(version="two", num_videos=1, num_frames=4)

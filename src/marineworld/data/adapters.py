@@ -32,6 +32,13 @@ class CompositeAdapter:
             name: adapter.build_manifest(Path(self.roots[name]))
             for name, adapter in self.components.items()
         }
+        if empty := sorted(name for name, manifest in manifests.items() if not manifest.records):
+            detail = "; ".join(f"{name} at {Path(self.roots[name])}" for name in empty)
+            raise ValueError(
+                f"joint corpus component(s) resolved to zero videos: {detail}. "
+                "Every component declared in the config must be present, otherwise the "
+                "mixture silently becomes a different corpus than the one it is named for."
+            )
         records = tuple(
             replace(record, id=f"{name}:{record.id}", dataset=name)
             for name, manifest in manifests.items()
