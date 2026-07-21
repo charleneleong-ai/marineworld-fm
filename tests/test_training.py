@@ -1197,6 +1197,22 @@ def test_annotated_fvessel_batches_omit_non_collatable_targets(
     assert batch["pixel_values"].shape == (1, 4, 3, 16, 16)
 
 
+@pytest.mark.parametrize(
+    ("weights", "message"),
+    [
+        ({"smd": 0.5, "fvessel": 0.5}, r"absent from the corpus: smd\. Present: fvessel"),
+        ({"fvessel": 1.0, "nir": 1.0}, r"absent from the corpus: nir"),
+        ({"fvessel": 0.0}, r"must be positive: fvessel"),
+    ],
+)
+def test_balanced_sampler_names_the_offending_dataset(
+    weights: dict[str, float], message: str
+) -> None:
+    """A joint config pointed at a missing corpus must say which one is missing."""
+    with pytest.raises(ValueError, match=message):
+        BalancedDatasetSampler(("fvessel", "fvessel"), weights=weights, seed=7)
+
+
 def test_balanced_sampler_equalizes_datasets_and_replays_from_epoch() -> None:
     dataset_ids = ("smd",) * 90 + ("fvessel",) * 10
     first = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
