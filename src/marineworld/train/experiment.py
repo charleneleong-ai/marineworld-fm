@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from omegaconf import DictConfig, OmegaConf
 
-from marineworld.data.manifest import directory_checksum, file_checksum
+from marineworld.data.manifest import content_identity
 
 if TYPE_CHECKING:
     from pytorch_lightning.loggers import WandbLogger
@@ -95,8 +95,14 @@ def build_run_identity(
     )
 
 
-def build_wandb_logger(cfg: DictConfig, identity: RunIdentity) -> WandbLogger | Literal[False]:
-    """Construct W&B logging without artifacts for offline runs."""
+def build_wandb_logger(
+    cfg: DictConfig, identity: RunIdentity, config: dict[str, Any] | None = None
+) -> WandbLogger | Literal[False]:
+    """Construct W&B logging without artifacts for offline runs.
+
+    ``config`` accepts an already-resolved config so callers that needed it for the
+    run identity do not pay for the filesystem-touching resolution twice.
+    """
     mode = str(cfg.tracking.mode)
     if mode == "disabled":
         return False
@@ -111,7 +117,7 @@ def build_wandb_logger(cfg: DictConfig, identity: RunIdentity) -> WandbLogger | 
         tags=list(identity.tags),
         offline=mode == "offline",
         log_model="all" if mode == "online" else False,
-        config=resolved_config(cfg),
+        config=resolved_config(cfg) if config is None else config,
     )
 
 
@@ -138,10 +144,8 @@ def _checkpoint_identity(value: Any) -> Any:
     if not isinstance(value, str):
         return _redact_config(value)
     path = Path(value).expanduser()
-    if path.is_file():
-        return f"sha256:{file_checksum(path)}"
-    if path.is_dir():
-        return f"sha256-directory:{directory_checksum(path)}"
+    if (identity := content_identity(path)) is not None:
+        return identity
     if path.is_absolute() or value.startswith("~"):
         return f"unavailable:{path.name}"
     return value

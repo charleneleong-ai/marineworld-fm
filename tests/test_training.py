@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -18,8 +19,9 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader
 
+import marineworld.train.experiment as experiment_module
 from marineworld.data.adapters import CompositeAdapter
-from marineworld.data.clips import AutoVideoDecoder, SyntheticVideoDecoder
+from marineworld.data.clips import AutoVideoDecoder, SyntheticVideoDecoder, build_clip_index
 from marineworld.data.contracts import DatasetManifest
 from marineworld.data.fvessel import FVesselAdapter
 from marineworld.data.manifest import manifest_checksum
@@ -1213,6 +1215,38 @@ def test_balanced_sampler_names_the_offending_dataset(
         BalancedDatasetSampler(("fvessel", "fvessel"), weights=weights, seed=7)
 
 
+def test_shared_resolved_config_is_not_recomputed_by_the_logger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resolved_config touches the filesystem, so the run must resolve it once."""
+    calls: list[int] = []
+    real = experiment_module.resolved_config
+
+    def counting(cfg: DictConfig) -> dict[str, object]:
+        calls.append(1)
+        return real(cfg)
+
+    monkeypatch.setattr(experiment_module, "resolved_config", counting)
+    cfg = _compose_config("data=synthetic", "model=videomae_tiny", "runtime=local_smoke")
+    identity = build_run_identity("videomae", ("manifest",), 42, None)
+
+    build_wandb_logger(cfg, identity, real(cfg))
+
+    assert calls == []
+
+
+def test_clip_index_reuses_a_supplied_fingerprint(tmp_path: Path) -> None:
+    """Both split datasets share one corpus hash instead of each rehashing it."""
+    manifest = SyntheticAdapter(num_frames=4, num_videos=12).build_manifest(tmp_path / "data")
+    index = functools.partial(
+        build_clip_index, manifest, split="train", frames=2, stride=1, seed=42
+    )
+
+    assert index(fingerprint=manifest_checksum(manifest)) == index()
+    # ordering is fingerprint-derived, so a supplied value must actually be used
+    assert index(fingerprint="a-different-corpus") != index()
+
+
 def test_balanced_sampler_equalizes_datasets_and_replays_from_epoch() -> None:
     dataset_ids = ("smd",) * 90 + ("fvessel",) * 10
     first = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
@@ -1570,8 +1604,17 @@ def test_masks_are_unique_per_accumulated_microbatch() -> None:
     assert not torch.equal(first, second)
 
 
+def test_scheduler_without_trainer_requires_an_explicit_step_budget() -> None:
+    module = VideoMAEPretrainingModule(_tiny_model_config(), warmup_epochs=1, max_epochs=4)
+
+    with pytest.raises(RuntimeError, match="attach a Trainer or pass total_steps"):
+        module.configure_optimizers()
+
+
 def test_optimizer_uses_warmup_cosine_scheduler() -> None:
-    module = VideoMAEPretrainingModule(_tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4)
+    module = VideoMAEPretrainingModule(
+        _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4, total_steps=8
+    )
     configured = module.configure_optimizers()
 
     assert configured["lr_scheduler"]["interval"] == "step"
@@ -1586,7 +1629,7 @@ def test_optimizer_uses_warmup_cosine_scheduler() -> None:
     assert values[-1] < values[2]
 
     resumed_module = VideoMAEPretrainingModule(
-        _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4
+        _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4, total_steps=8
     )
     resumed = resumed_module.configure_optimizers()["lr_scheduler"]["scheduler"]
     resumed.load_state_dict(scheduler.state_dict())
@@ -1682,18 +1725,6 @@ def test_sampler_callback_advances_relative_to_restored_position() -> None:
     callback.on_train_batch_end(None, None, None, None, batch_idx=1)  # type: ignore[arg-type]
 
     assert sampler.position == 8
-
-
-def test_build_dataloaders_accepts_legacy_adapter_position(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    adapter = SyntheticAdapter(num_frames=4, num_videos=2)
-    manifest = adapter.build_manifest(tmp_path / "data")
-    cfg = _smoke_config(tmp_path, max_steps=1)
-
-    loaders = build_dataloaders(cfg, manifest, adapter)
-
-    assert loaders["train_dataloaders"]
 
 
 def test_joint_split_preserves_each_component_in_training(tmp_path: Path) -> None:

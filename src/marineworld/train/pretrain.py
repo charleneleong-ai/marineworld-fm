@@ -197,13 +197,12 @@ class _ExceptionSafeModelCheckpoint(ModelCheckpoint):
 def build_dataloaders(
     cfg: DictConfig,
     manifest: DatasetManifest,
-    adapter: object | None = None,
 ) -> dict[str, DataLoader[dict[str, Any]]]:
     """Build train and validation loaders over the shared clip contract."""
-    del adapter
     decoder = _build_decoder(cfg)
     common = {
         "manifest": manifest,
+        "fingerprint": manifest_checksum(manifest),
         "decoder": decoder,
         "frames": int(cfg.model.num_frames),
         "stride": 1,
@@ -287,15 +286,19 @@ def run_pretraining(cfg: DictConfig) -> Path:
     manifest = _prepare_manifest(cfg, adapter.build_manifest(Path(cfg.data.root)))
     dataloaders = build_dataloaders(cfg, manifest)
     checkpoint_provenance = _checkpoint_provenance(cfg.runtime.ckpt_path)
-    identity = _training_run_identity(cfg, manifest, checkpoint_provenance)
-    return _run_with_identity(cfg, manifest, dataloaders, identity)
+    resolved = resolved_config(cfg)
+    identity = _training_run_identity(cfg, manifest, checkpoint_provenance, resolved)
+    return _run_with_identity(cfg, manifest, dataloaders, identity, resolved)
 
 
 def _training_run_identity(
-    cfg: DictConfig, manifest: DatasetManifest, checkpoint_provenance: str | None = None
+    cfg: DictConfig,
+    manifest: DatasetManifest,
+    checkpoint_provenance: str | None = None,
+    resolved: dict[str, Any] | None = None,
 ) -> RunIdentity:
     checksums = tuple(manifest.component_checksums.values()) or (manifest_checksum(manifest),)
-    resolved = resolved_config(cfg)
+    resolved = resolved_config(cfg) if resolved is None else resolved
     material = {
         "data": resolved["data"],
         "model": resolved["model"],
@@ -325,8 +328,9 @@ def _run_with_identity(
     manifest: DatasetManifest,
     dataloaders: dict[str, DataLoader[dict[str, Any]]],
     identity: RunIdentity,
+    resolved: dict[str, Any] | None = None,
 ) -> Path:
-    logger = build_wandb_logger(cfg, identity)
+    logger = build_wandb_logger(cfg, identity, resolved)
     checkpoint = _ExceptionSafeModelCheckpoint(
         dirpath=Path(cfg.output_dir) / "checkpoints",
         monitor=metric_name("val", "loss"),
