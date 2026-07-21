@@ -71,6 +71,25 @@ class VideoMAEPretrainingModule(LightningModule):
         )
         return loss
 
+    def on_before_optimizer_step(self, optimizer: torch.optim.Optimizer) -> None:
+        """Record what the schedule is doing and how large the update is."""
+        self.log(
+            metric_name("pretrain", "lr"),
+            optimizer.param_groups[0]["lr"],
+            on_step=True,
+            on_epoch=False,
+        )
+        grads = [
+            parameter.grad.detach() for parameter in self.parameters() if parameter.grad is not None
+        ]
+        if grads:
+            self.log(
+                metric_name("pretrain", "grad_norm"),
+                torch.linalg.vector_norm(torch.stack([grad.norm(2) for grad in grads]), 2),
+                on_step=True,
+                on_epoch=False,
+            )
+
     def validation_step(self, batch: Mapping[str, Any], batch_idx: int) -> torch.Tensor:
         loss = self._reconstruction_loss(batch, batch_idx, stage="validation")
         self.log(
