@@ -69,7 +69,7 @@ class WandbMediaCallback(Callback):
             warnings.warn("media preview requires a VideoMAE pretraining module", stacklevel=2)
             return
 
-        self._sample = _first_sample(batch)
+        self._sample = self._first_sample(batch)
         if trainer.current_epoch % self.every_n_epochs != 0:
             return
         self._emit(
@@ -79,7 +79,9 @@ class WandbMediaCallback(Callback):
     def on_fit_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         sample, self._sample = self._sample, None
         logger = (
-            _wandb_logger(trainer.logger) if self.enabled and trainer.global_rank == 0 else None
+            self._wandb_logger(trainer.logger)
+            if self.enabled and trainer.global_rank == 0
+            else None
         )
         if logger is None or sample is None:
             if logger is not None and sample is None:
@@ -96,7 +98,7 @@ class WandbMediaCallback(Callback):
             warnings.warn("best checkpoint media skipped: no best checkpoint", stacklevel=2)
             return
 
-        restored = _restore_module(pl_module, Path(best_model_path))
+        restored = self._restore_module(pl_module, Path(best_model_path))
         if restored is None:
             return
         self._emit(logger, restored, sample, stage="best", trainer=trainer, microbatch=0)
@@ -121,7 +123,7 @@ class WandbMediaCallback(Callback):
         self._emit(
             logger,
             pl_module,
-            _first_sample(batch, to_cpu=False),
+            self._first_sample(batch, to_cpu=False),
             stage="pretrain",
             trainer=trainer,
             microbatch=batch_idx,
@@ -137,153 +139,137 @@ class WandbMediaCallback(Callback):
         trainer: Trainer,
         microbatch: int,
     ) -> None:
-        """Render one preview and log it under the given stage."""
-        preview = _preview_from_module(
-            module,
-            sample,
+        """Render one preview from the live weights and log it under the given stage."""
+        pixel_values = sample["pixel_values"].to(module.device)
+        mask = module.make_mask(
+            pixel_values.shape[0],
+            pixel_values.device,
             step=trainer.global_step,
             microbatch=microbatch,
+        )
+        was_training = module.training
+        module.eval()
+        try:
+            with torch.inference_mode():
+                logits = module.model(pixel_values=pixel_values, bool_masked_pos=mask).logits
+        finally:
+            module.train(was_training)
+        if logits is None:
+            warnings.warn(
+                "media preview skipped: model returned no reconstruction logits", stacklevel=2
+            )
+            return
+
+        config = module.model.config
+        preview = build_media_preview(
+            pixel_values=pixel_values,
+            bool_masked_pos=mask,
+            logits=logits,
             mean=self.mean,
             std=self.std,
+            patch_size=pair(config.patch_size),
+            tubelet_size=int(config.tubelet_size),
             max_frames=self.max_frames,
+            dataset=str(sample["dataset"]),
+            source=str(sample["source"]),
+            norm_pix_loss=bool(config.norm_pix_loss),
         )
-        if preview is not None:
-            _log_preview(logger, preview, stage, trainer.global_step)
+        self._log_preview(logger, preview, stage, trainer.global_step)
 
     def _preview_logger(
         self, trainer: Trainer, batch_idx: int, dataloader_idx: int = 0
     ) -> Any | None:
         if batch_idx != 0 or dataloader_idx != 0 or not self.enabled or trainer.global_rank != 0:
             return None
-        return _wandb_logger(trainer.logger)
+        return self._wandb_logger(trainer.logger)
 
+    @staticmethod
+    def _wandb_logger(logger: object) -> Any | None:
+        """Return a Lightning W&B logger without importing W&B or its logger."""
+        logger_type = type(logger)
+        if logger_type.__name__ != "WandbLogger" or not logger_type.__module__.endswith(
+            ".loggers.wandb"
+        ):
+            return None
+        return logger if callable(getattr(logger, "log_metrics", None)) else None
 
-def _wandb_logger(logger: object) -> Any | None:
-    """Return a Lightning W&B logger without importing W&B or its logger."""
-    logger_type = type(logger)
-    if logger_type.__name__ != "WandbLogger" or not logger_type.__module__.endswith(
-        ".loggers.wandb"
-    ):
-        return None
-    return logger if callable(getattr(logger, "log_metrics", None)) else None
+    @staticmethod
+    def _first_sample(batch: Mapping[str, Any], *, to_cpu: bool = True) -> dict[str, Any]:
+        """Copy the first clip; retained samples go to CPU, inline ones stay on device."""
+        pixel_values = batch["pixel_values"][:1].detach()
+        return {
+            "pixel_values": pixel_values.cpu().clone() if to_cpu else pixel_values,
+            "dataset": WandbMediaCallback._first_metadata(batch, "dataset"),
+            "source": WandbMediaCallback._first_metadata(batch, "source"),
+        }
 
+    @staticmethod
+    def _first_metadata(batch: Mapping[str, Any], key: str) -> str:
+        value = batch.get(key, "unknown")
+        if isinstance(value, str):
+            return value
+        return str(value[0]) if value else "unknown"
 
-def _first_sample(batch: Mapping[str, Any], *, to_cpu: bool = True) -> dict[str, Any]:
-    """Copy the first clip; retained samples go to CPU, inline ones stay on device."""
-    pixel_values = batch["pixel_values"][:1].detach()
-    return {
-        "pixel_values": pixel_values.cpu().clone() if to_cpu else pixel_values,
-        "dataset": _first_metadata(batch, "dataset"),
-        "source": _first_metadata(batch, "source"),
-    }
+    @staticmethod
+    def _restore_module(
+        live_module: VideoMAEPretrainingModule, checkpoint_path: Path
+    ) -> VideoMAEPretrainingModule | None:
+        try:
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+        except (EOFError, OSError, pickle.UnpicklingError, RuntimeError, ValueError):
+            warnings.warn(
+                "best checkpoint media skipped: checkpoint could not be loaded",
+                stacklevel=2,
+            )
+            return None
+        if not isinstance(checkpoint, Mapping) or not isinstance(
+            checkpoint.get("state_dict"), Mapping
+        ):
+            warnings.warn(
+                "best checkpoint media skipped: checkpoint has no state_dict", stacklevel=2
+            )
+            return None
 
-
-def _first_metadata(batch: Mapping[str, Any], key: str) -> str:
-    value = batch.get(key, "unknown")
-    if isinstance(value, str):
-        return value
-    return str(value[0]) if value else "unknown"
-
-
-def _preview_from_module(
-    module: VideoMAEPretrainingModule,
-    sample: Mapping[str, Any],
-    *,
-    step: int,
-    microbatch: int,
-    mean: Sequence[float],
-    std: Sequence[float],
-    max_frames: int,
-) -> MediaPreview | None:
-    pixel_values = sample["pixel_values"].to(module.device)
-    mask = module.make_mask(
-        pixel_values.shape[0], pixel_values.device, step=step, microbatch=microbatch
-    )
-    was_training = module.training
-    module.eval()
-    try:
-        with torch.inference_mode():
-            logits = module.model(pixel_values=pixel_values, bool_masked_pos=mask).logits
-    finally:
-        module.train(was_training)
-    if logits is None:
-        warnings.warn(
-            "media preview skipped: model returned no reconstruction logits", stacklevel=2
+        restored = VideoMAEPretrainingModule(
+            dict(live_module.model_config),
+            lr=live_module.lr,
+            weight_decay=live_module.weight_decay,
+            seed=live_module.seed,
+            warmup_epochs=live_module.warmup_epochs,
+            max_epochs=live_module.max_epochs,
         )
-        return None
+        try:
+            restored.load_state_dict(checkpoint["state_dict"])
+        except RuntimeError:
+            warnings.warn(
+                "best checkpoint media skipped: checkpoint state is incompatible",
+                stacklevel=2,
+            )
+            return None
+        restored.eval()
+        return restored
 
-    config = module.model.config
-    patch_size = pair(config.patch_size)
-    return build_media_preview(
-        pixel_values=pixel_values,
-        bool_masked_pos=mask,
-        logits=logits,
-        mean=mean,
-        std=std,
-        patch_size=patch_size,
-        tubelet_size=int(config.tubelet_size),
-        max_frames=max_frames,
-        dataset=str(sample["dataset"]),
-        source=str(sample["source"]),
-        norm_pix_loss=bool(config.norm_pix_loss),
-    )
+    @staticmethod
+    def _log_preview(logger: Any, preview: MediaPreview, stage: str, step: int) -> None:
+        """Log previews under the stage that produced them, split per dataset."""
+        import wandb
 
-
-def _restore_module(
-    live_module: VideoMAEPretrainingModule, checkpoint_path: Path
-) -> VideoMAEPretrainingModule | None:
-    try:
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-            mmap=True,
+        logger.log_metrics(
+            {
+                metric_name(stage, "media/inputs", preview.dataset): wandb.Image(
+                    preview.input_grid, caption=preview.caption
+                ),
+                metric_name(stage, "media/reconstruction", preview.dataset): wandb.Image(
+                    preview.reconstruction_panel, caption=preview.caption
+                ),
+            },
+            step=step,
         )
-    except (EOFError, OSError, pickle.UnpicklingError, RuntimeError, ValueError):
-        warnings.warn(
-            "best checkpoint media skipped: checkpoint could not be loaded",
-            stacklevel=2,
-        )
-        return None
-    if not isinstance(checkpoint, Mapping) or not isinstance(checkpoint.get("state_dict"), Mapping):
-        warnings.warn("best checkpoint media skipped: checkpoint has no state_dict", stacklevel=2)
-        return None
-
-    restored = VideoMAEPretrainingModule(
-        dict(live_module.model_config),
-        lr=live_module.lr,
-        weight_decay=live_module.weight_decay,
-        seed=live_module.seed,
-        warmup_epochs=live_module.warmup_epochs,
-        max_epochs=live_module.max_epochs,
-    )
-    try:
-        restored.load_state_dict(checkpoint["state_dict"])
-    except RuntimeError:
-        warnings.warn(
-            "best checkpoint media skipped: checkpoint state is incompatible",
-            stacklevel=2,
-        )
-        return None
-    restored.eval()
-    return restored
-
-
-def _log_preview(logger: Any, preview: MediaPreview, stage: str, step: int) -> None:
-    """Log previews under the stage that produced them, split per dataset."""
-    import wandb
-
-    logger.log_metrics(
-        {
-            metric_name(stage, "media/inputs", preview.dataset): wandb.Image(
-                preview.input_grid, caption=preview.caption
-            ),
-            metric_name(stage, "media/reconstruction", preview.dataset): wandb.Image(
-                preview.reconstruction_panel, caption=preview.caption
-            ),
-        },
-        step=step,
-    )
 
 
 def build_media_preview(
@@ -316,9 +302,9 @@ def build_media_preview(
     masked = original.masked_fill(pixel_mask, 0.5)
     error = (original - completed).abs().mean(dim=2, keepdim=True).expand_as(original)
 
-    indices = _frame_indices(original.shape[1], max_frames).to(original.device)
+    indices = torch.arange(min(original.shape[1], max_frames)).to(original.device)
     originals = original[0, indices]
-    input_grid = _to_hwc(_horizontal_grid(originals))
+    input_grid = _to_hwc(torch.cat(tuple(originals), dim=-1))
     rows = torch.cat(
         (originals, masked[0, indices], completed[0, indices], error[0, indices]), dim=-1
     )
@@ -500,16 +486,6 @@ def _unpatchify(
         .permute(0, 1, 4, 7, 2, 5, 3, 6)
         .reshape(batch, frames, channels, height, width)
     )
-
-
-def _frame_indices(total: int, maximum: int) -> torch.Tensor:
-    """Return at most ``maximum`` evenly-spaced frame indices."""
-    return torch.linspace(0, total - 1, steps=min(total, maximum), dtype=torch.long)
-
-
-def _horizontal_grid(frames: torch.Tensor) -> torch.Tensor:
-    """Place ``[F, C, H, W]`` frames side by side."""
-    return torch.cat(tuple(frames), dim=-1)
 
 
 def _to_hwc(array: torch.Tensor) -> np.ndarray:
