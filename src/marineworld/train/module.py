@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from pytorch_lightning import LightningModule
 
-from marineworld.models.videomae import build_videomae, tube_mask
+from marineworld.models.videomae import build_videomae, pair, tube_mask
 from marineworld.train.naming import metric_name
 
 __all__ = ["VideoMAEPretrainingModule"]
@@ -145,14 +145,10 @@ class VideoMAEPretrainingModule(LightningModule):
 
 
 def _sequence_length(config: Any) -> int:
-    image_height, image_width = _pair(config.image_size)
-    patch_height, patch_width = _pair(config.patch_size)
+    image_height, image_width = pair(config.image_size)
+    patch_height, patch_width = pair(config.patch_size)
     return (
         (config.num_frames // config.tubelet_size)
         * (image_height // patch_height)
         * (image_width // patch_width)
     )
-
-
-def _pair(value: int | tuple[int, int] | list[int]) -> tuple[int, int]:
-    return (value, value) if isinstance(value, int) else (value[0], value[1])

@@ -89,7 +89,7 @@ def run_probe_condition(
     except Exception as error:
         if not run.optional or not _is_resource_error(error):
             raise
-        return (_skipped_result(run),)
+        return (probe_result(run, "SKIPPED_RESOURCE"),)
 
 
 def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
@@ -153,12 +153,8 @@ def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
     try:
         selection_path = _write_selection_manifest(cfg, manifest, runs)
         _log_selection_manifest(selection_path, identity.run_id, logger)
-        if (
-            split_error is not None
-            or not _has_supervised_labels(manifest)
-            or not _has_required_frames(manifest, int(cfg.model.num_frames))
-        ):
-            results = tuple(_unavailable_result(run) for run in runs)
+        if split_error is not None or not has_labelled_splits(manifest, int(cfg.model.num_frames)):
+            results = tuple(probe_result(run, "SKIPPED_UNAVAILABLE_LABELS") for run in runs)
             log_probe_results(results, logger)
             return results
         results = run_probe_condition(
@@ -173,7 +169,7 @@ def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
             evaluator=lambda encoder: _evaluate_runs(cfg, manifest, adapter, encoder, runs),
         )
         if len(results) == 1 and results[0].status == "SKIPPED_RESOURCE":
-            results = tuple(_skipped_result(run) for run in runs)
+            results = tuple(probe_result(run, "SKIPPED_RESOURCE") for run in runs)
         log_probe_results(results, logger)
         if diagnostic_path.is_file():
             _log_diagnostic_artifact(diagnostic_path, logger)
@@ -379,22 +375,12 @@ def _prepare_probe_manifest(cfg: DictConfig, manifest: DatasetManifest) -> Datas
     )
 
 
-def _has_supervised_labels(manifest: DatasetManifest) -> bool:
+def has_labelled_splits(manifest: DatasetManifest, min_frames: int = 0) -> bool:
+    """Report whether train and val each hold a labelled video of usable length."""
     return all(
         any(
             record.split == split
-            and (record.dataset == "synthetic" or record.annotation_path is not None)
-            for record in manifest.records
-        )
-        for split in ("train", "val")
-    )
-
-
-def _has_required_frames(manifest: DatasetManifest, required: int) -> bool:
-    return all(
-        any(
-            record.split == split
-            and record.num_frames >= required
+            and record.num_frames >= min_frames
             and (record.dataset == "synthetic" or record.annotation_path is not None)
             for record in manifest.records
         )
@@ -415,9 +401,9 @@ def _evaluate_runs(
         train = _extract_features(cfg, manifest, adapter, encoder, split="train")
         validation = _extract_features(cfg, manifest, adapter, encoder, split="val")
     except LabelsUnavailableError:
-        return tuple(_unavailable_result(run) for run in runs)
+        return tuple(probe_result(run, "SKIPPED_UNAVAILABLE_LABELS") for run in runs)
     if validation.labels.unique().numel() < 2:
-        return tuple(_degenerate_result(run) for run in runs)
+        return tuple(probe_result(run, "SKIPPED_DEGENERATE_LABELS") for run in runs)
     if len(runs) == 1:
         _write_representation_diagnostics(
             cfg, runs[0], train, validation, manifest, adapter, encoder
@@ -429,11 +415,11 @@ def _evaluate_runs(
             index for index, record_id in enumerate(train.record_ids) if record_id in selected
         ]
         if not indices:
-            results.append(_unavailable_result(run))
+            results.append(probe_result(run, "SKIPPED_UNAVAILABLE_LABELS"))
             continue
         selected_labels = train.labels[indices]
         if selected_labels.unique().numel() < 2:
-            results.append(_degenerate_result(run))
+            results.append(probe_result(run, "SKIPPED_DEGENERATE_LABELS"))
             continue
         probe = fit_linear_probe(
             encoder,
@@ -651,20 +637,20 @@ def _evaluate_dense_runs(
                 seed=run.seed,
             )
         except DegenerateLabelsError:
-            results.append(_degenerate_result(run))
+            results.append(probe_result(run, "SKIPPED_DEGENERATE_LABELS"))
             continue
         except LabelsUnavailableError:
-            results.append(_unavailable_result(run))
+            results.append(probe_result(run, "SKIPPED_UNAVAILABLE_LABELS"))
             continue
         try:
             metric, value = evaluate_dense_probe_streaming(probe, validation_batches)
         except LabelsUnavailableError:
-            results.append(_unavailable_result(run))
+            results.append(probe_result(run, "SKIPPED_UNAVAILABLE_LABELS"))
             continue
         except DegenerateLabelsError:
-            results.append(_degenerate_result(run))
+            results.append(probe_result(run, "SKIPPED_DEGENERATE_LABELS"))
             continue
-        results.append(_completed_result(run, metric, value))
+        results.append(probe_result(run, "COMPLETED", metric=metric, value=value))
         has_test_records = any(record.split == "test" for record in manifest.records)
         if bool(cfg.eval.get("report_test", False)) and has_test_records:
             test_dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split="test")
@@ -676,22 +662,29 @@ def _evaluate_dense_runs(
             try:
                 test_metric, test_value = evaluate_dense_probe_streaming(probe, test_batches)
             except (LabelsUnavailableError, DegenerateLabelsError):
-                results.append(replace(_unavailable_result(run), evaluation_split="test"))
+                results.append(
+                    replace(
+                        probe_result(run, "SKIPPED_UNAVAILABLE_LABELS"), evaluation_split="test"
+                    )
+                )
             else:
                 results.append(
                     replace(
-                        _completed_result(run, test_metric, test_value),
+                        probe_result(run, "COMPLETED", metric=test_metric, value=test_value),
                         evaluation_split="test",
                     )
                 )
     return tuple(results)
 
 
-def _completed_result(
+def probe_result(
     run: ProbeRun,
-    metric: str,
-    value: float,
+    status: str,
+    *,
+    metric: str | None = None,
+    value: float | None = None,
 ) -> ProbeResult:
+    """Build one result row, which differs between outcomes only by status and value."""
     return ProbeResult(
         condition=run.condition,
         checkpoint=run.checkpoint,
@@ -700,9 +693,9 @@ def _completed_result(
         task=run.task,
         fraction=run.fraction,
         seed=run.seed,
-        metric=metric,
+        metric=run.metric if metric is None else metric,
         value=value,
-        status="COMPLETED",
+        status=status,
         model=run.model,
         device=run.device,
         **_subset_metadata(run.selected_record_ids),
@@ -914,60 +907,6 @@ def _supervised_scalar_label(sample: dict[str, Any], task: str) -> int | None:
     if not bool(sample["is_labelled"]):
         return None
     return _sample_label(sample, task)
-
-
-def _skipped_result(run: ProbeRun) -> ProbeResult:
-    return ProbeResult(
-        condition=run.condition,
-        checkpoint=run.checkpoint,
-        manifest_checksum=run.manifest_checksum,
-        dataset=run.dataset,
-        task=run.task,
-        fraction=run.fraction,
-        seed=run.seed,
-        metric=run.metric,
-        value=None,
-        status="SKIPPED_RESOURCE",
-        model=run.model,
-        device=run.device,
-        **_subset_metadata(run.selected_record_ids),
-    )
-
-
-def _degenerate_result(run: ProbeRun) -> ProbeResult:
-    return ProbeResult(
-        condition=run.condition,
-        checkpoint=run.checkpoint,
-        manifest_checksum=run.manifest_checksum,
-        dataset=run.dataset,
-        task=run.task,
-        fraction=run.fraction,
-        seed=run.seed,
-        metric=run.metric,
-        value=None,
-        status="SKIPPED_DEGENERATE_LABELS",
-        model=run.model,
-        device=run.device,
-        **_subset_metadata(run.selected_record_ids),
-    )
-
-
-def _unavailable_result(run: ProbeRun) -> ProbeResult:
-    return ProbeResult(
-        condition=run.condition,
-        checkpoint=run.checkpoint,
-        manifest_checksum=run.manifest_checksum,
-        dataset=run.dataset,
-        task=run.task,
-        fraction=run.fraction,
-        seed=run.seed,
-        metric=run.metric,
-        value=None,
-        status="SKIPPED_UNAVAILABLE_LABELS",
-        model=run.model,
-        device=run.device,
-        **_subset_metadata(run.selected_record_ids),
-    )
 
 
 def _labelled_training_records(manifest: DatasetManifest, min_frames: int) -> tuple[Any, ...]:

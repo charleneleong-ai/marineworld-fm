@@ -23,7 +23,7 @@ from requests import Timeout as RequestsTimeout
 from safetensors import SafetensorError, safe_open
 
 from marineworld.data.clips import SpatialTransform
-from marineworld.models.videomae import build_videomae
+from marineworld.models.videomae import build_videomae, pair
 
 EncoderCondition = Literal[
     "random",
@@ -559,8 +559,8 @@ def _reshape_tokens(tokens: torch.Tensor, config: Any) -> torch.Tensor:
     image_size = getattr(config, "image_size", getattr(config, "crop_size", None))
     if image_size is None:
         raise ValueError("encoder config must define image_size or crop_size")
-    image_height, image_width = _pair(image_size)
-    patch_height, patch_width = _pair(config.patch_size)
+    image_height, image_width = pair(image_size)
+    patch_height, patch_width = pair(config.patch_size)
     rows, columns = image_height // patch_height, image_width // patch_width
     expected = temporal * rows * columns
     if tokens.shape[1] != expected:
@@ -574,18 +574,14 @@ def _reshape_image_tokens(
     frames: int,
     batch_size: int,
 ) -> torch.Tensor:
-    image_height, image_width = _pair(config.image_size)
-    patch_height, patch_width = _pair(config.patch_size)
+    image_height, image_width = pair(config.image_size)
+    patch_height, patch_width = pair(config.patch_size)
     rows, columns = image_height // patch_height, image_width // patch_width
     patch_tokens = rows * columns
     if tokens.shape[1] < patch_tokens:
         raise ValueError(f"expected at least {patch_tokens} image tokens, got {tokens.shape[1]}")
     tokens = tokens[:, -patch_tokens:]
     return tokens.reshape(batch_size, frames, rows, columns, tokens.shape[-1])
-
-
-def _pair(value: int | tuple[int, int] | list[int]) -> tuple[int, int]:
-    return (value, value) if isinstance(value, int) else (value[0], value[1])
 
 
 def _processor_spatial_transform(

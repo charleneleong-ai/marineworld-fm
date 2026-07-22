@@ -68,7 +68,6 @@ from marineworld.eval.run_probes import (
     _count_bin,
     _dense_batch_factory,
     _dense_token_labels,
-    _has_supervised_labels,
     _labelled_training_records,
     _log_diagnostic_artifact,
     _log_selection_manifest,
@@ -77,6 +76,7 @@ from marineworld.eval.run_probes import (
     _probe_run_identity,
     _sample_label,
     _supervised_scalar_label,
+    has_labelled_splits,
     log_probe_results,
     run_evaluation,
     run_probe_condition,
@@ -2106,7 +2106,7 @@ def test_unlabelled_smd_manifest_is_explicitly_unavailable(tmp_path: Path) -> No
         for split in ("train", "val")
     )
 
-    assert not _has_supervised_labels(DatasetManifest("smd", "v1", "research", records))
+    assert not has_labelled_splits(DatasetManifest("smd", "v1", "research", records))
 
 
 def test_unlabelled_smd_runner_records_known_empty_selection_and_artifact(

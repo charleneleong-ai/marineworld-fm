@@ -8,7 +8,12 @@ from typing import Any
 import torch
 from transformers import VideoMAEConfig, VideoMAEForPreTraining
 
-__all__ = ["build_videomae", "encode_video", "tube_mask"]
+__all__ = ["build_videomae", "encode_video", "pair", "tube_mask"]
+
+
+def pair(value: int | tuple[int, int] | list[int]) -> tuple[int, int]:
+    """Normalise a scalar-or-pair config field to an explicit (height, width)."""
+    return (value, value) if isinstance(value, int) else (value[0], value[1])
 
 
 def tube_mask(
