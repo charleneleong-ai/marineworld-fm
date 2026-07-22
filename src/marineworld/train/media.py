@@ -14,6 +14,7 @@ import torch
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
+from marineworld.models.videomae import pair
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.train.naming import metric_name
 
@@ -212,11 +213,7 @@ def _preview_from_module(
         return None
 
     config = module.model.config
-    patch_size = (
-        (int(config.patch_size), int(config.patch_size))
-        if isinstance(config.patch_size, int)
-        else tuple(config.patch_size)
-    )
+    patch_size = pair(config.patch_size)
     return build_media_preview(
         pixel_values=pixel_values,
         bool_masked_pos=mask,
