@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
@@ -9,6 +11,26 @@ from typing import Any, Mapping, Protocol
 
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 from marineworld.data.manifest import manifest_checksum
+
+
+def resolve_frame_count(
+    configured: int | None, video: Path, probe: Callable[[Path], int], dataset: str
+) -> int:
+    """Take the configured frame count, or probe the video, and require it positive."""
+    count = configured if configured is not None else probe(video)
+    if count <= 0:
+        raise ValueError(f"{dataset} frame count must be positive for {video}, got {count}")
+    return count
+
+
+def resolve_fps(
+    configured: float | None, video: Path, probe: Callable[[Path], float], dataset: str
+) -> float:
+    """Take the configured FPS, or probe the video, and require it finite and positive."""
+    fps = configured if configured is not None else probe(video)
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"{dataset} FPS must be positive for {video}, got {fps}")
+    return fps
 
 
 class DatasetAdapter(Protocol):
