@@ -54,5 +54,15 @@ where = ["src"]
 line-length = 100
 target-version = "py313"
 
+# Complexity only: this never reformats existing style, it just refuses growth.
+[tool.ruff.lint]
+extend-select = ["C901", "PLR0915"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-statements = 50
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

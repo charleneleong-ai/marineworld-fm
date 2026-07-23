@@ -284,11 +284,8 @@ def _probe_run_identity(
     )
 
 
-def _validate_probe_config(cfg: DictConfig) -> None:
-    """Reject invalid probe matrices before adapters, loggers, or models are created."""
-    task = str(cfg.eval.task)
-    if task not in {"classification", "count", "dense"}:
-        raise ValueError(f"eval.task must be one of classification, count, or dense; got {task!r}")
+def validate_probe_matrix(cfg: DictConfig) -> None:
+    """Reject an invalid seed / label-fraction matrix."""
     _validate_seed("seed", cfg.seed)
     seeds = _config_values("eval.seeds", cfg.eval.seeds)
     if (
@@ -313,6 +310,10 @@ def _validate_probe_config(cfg: DictConfig) -> None:
         raise ValueError("eval.label_fractions values must be finite and in (0, 1]")
     if bool(cfg.eval.get("report_test", False)) and (len(seeds) != 1 or len(fractions) != 1):
         raise ValueError("eval.report_test requires exactly one selected seed and label fraction")
+
+
+def validate_probe_hyperparameters(cfg: DictConfig) -> None:
+    """Reject invalid probe optimisation and model geometry settings."""
     _require_positive_int("eval.batch_size", cfg.eval.batch_size)
     _require_positive_int("eval.dense_epochs", cfg.eval.dense_epochs)
     try:
@@ -327,6 +328,15 @@ def _validate_probe_config(cfg: DictConfig) -> None:
         mask_ratio = float(cfg.model.mask_ratio)
         if not math.isfinite(mask_ratio) or not 0 < mask_ratio < 1:
             raise ValueError("model.mask_ratio must be finite and in (0, 1)")
+
+
+def _validate_probe_config(cfg: DictConfig) -> None:
+    """Reject invalid probe matrices before adapters, loggers, or models are created."""
+    task = str(cfg.eval.task)
+    if task not in {"classification", "count", "dense"}:
+        raise ValueError(f"eval.task must be one of classification, count, or dense; got {task!r}")
+    validate_probe_matrix(cfg)
+    validate_probe_hyperparameters(cfg)
     condition = str(cfg.model.condition)
     configured_checkpoint = cfg.eval.checkpoint or cfg.model.get("checkpoint")
     revision = cfg.model.get("revision")
@@ -478,44 +488,31 @@ def _evaluate_runs(
                 **_subset_metadata(run.selected_record_ids),
             )
         )
-        smd_sources = {
-            source
-            for dataset, source in zip(test.datasets, test.sources, strict=True)
-            if dataset == "smd"
-        }
-        for source in sorted(smd_sources):
-            source_indices = [
-                i
-                for i, (dataset, value) in enumerate(zip(test.datasets, test.sources, strict=True))
-                if dataset == "smd" and value == source
-            ]
-            if not source_indices:
-                continue
-            source_metric, source_value = evaluate_probe(
-                final_probe,
-                test.features[source_indices],
-                test.labels[source_indices],
-                task=run.task,
-            )
-            results.append(
-                ProbeResult(
-                    condition=run.condition,
-                    checkpoint=run.checkpoint,
-                    manifest_checksum=run.manifest_checksum,
-                    dataset=f"smd/{source}",
-                    task=run.task,
-                    fraction=run.fraction,
-                    seed=run.seed,
-                    metric=source_metric,
-                    value=source_value,
-                    status="COMPLETED",
-                    model=run.model,
-                    device=run.device,
-                    evaluation_split="test",
-                    **_subset_metadata(run.selected_record_ids),
-                )
-            )
+        results.extend(smd_source_results(run, final_probe, test))
     return tuple(results)
+
+
+def smd_source_results(run: ProbeRun, probe: Any, test: _FeatureSet) -> list[ProbeResult]:
+    """Score each SMD capture source separately so domain shift is visible per subset."""
+    rows: list[ProbeResult] = []
+    pairs = list(zip(test.datasets, test.sources, strict=True))
+    for source in sorted({source for dataset, source in pairs if dataset == "smd"}):
+        indices = [
+            index
+            for index, (dataset, value) in enumerate(pairs)
+            if dataset == "smd" and value == source
+        ]
+        metric, value = evaluate_probe(
+            probe, test.features[indices], test.labels[indices], task=run.task
+        )
+        rows.append(
+            replace(
+                probe_result(run, "COMPLETED", metric=metric, value=value),
+                dataset=f"smd/{source}",
+                evaluation_split="test",
+            )
+        )
+    return rows
 
 
 def _write_representation_diagnostics(

@@ -22,7 +22,7 @@ repos:
     rev: v0.6.9
     hooks:
       - id: ruff
-        args: ["--fix", "--select", "E,W,F,I"]
+        args: ["--fix", "--select", "E,W,F,I,C901,PLR0915"]
       - id: ruff-format
 
   # Run the (fast, core-only) alignment + seed tests before pushing.
