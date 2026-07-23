@@ -257,13 +257,26 @@ def validate_encoder_request(
 
     local_checkpoint = _local_checkpoint_path(checkpoint)
     if local_checkpoint is not None:
-        if not local_checkpoint.exists():
-            raise ValueError(f"local checkpoint does not exist: {local_checkpoint}")
-        if revision:
-            raise ValueError("model.revision must be null for a local checkpoint")
-        _validate_local_checkpoint(condition, local_checkpoint)
+        validate_local_checkpoint_request(condition, local_checkpoint, revision)
         return
+    validate_hub_checkpoint_request(checkpoint, revision, require_pinned_revision)
 
+
+def validate_local_checkpoint_request(
+    condition: str, checkpoint: Path, revision: str | None
+) -> None:
+    """Require a local checkpoint to exist and to carry no Hub revision."""
+    if not checkpoint.exists():
+        raise ValueError(f"local checkpoint does not exist: {checkpoint}")
+    if revision:
+        raise ValueError("model.revision must be null for a local checkpoint")
+    _validate_local_checkpoint(condition, checkpoint)
+
+
+def validate_hub_checkpoint_request(
+    checkpoint: str, revision: str | None, require_pinned_revision: bool
+) -> None:
+    """Require a Hub reference to be owner/repository, pinned when weights are downloaded."""
     if not re.fullmatch(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*", checkpoint):
         raise ValueError(f"Hub checkpoint must use the 'owner/repository' form; got {checkpoint!r}")
     if require_pinned_revision and not re.fullmatch(r"[0-9a-fA-F]{40}", revision or ""):

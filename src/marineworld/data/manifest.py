@@ -129,6 +129,39 @@ def cached_file_checksum(path: Path, size: int, modified_ns: int) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def validate_boxes(record_id: str, boxes: np.ndarray, source_size: tuple[int, int]) -> None:
+    """Require boxes to be finite, positively sized and inside the source frame."""
+    height, width = source_size
+    if boxes.ndim != 2 or boxes.shape[1:] != (4,):
+        raise ValueError(f"record {record_id}: boxes must be shaped [N, 4]")
+    if not np.isfinite(boxes).all():
+        raise ValueError(f"record {record_id}: boxes must be finite")
+    if np.any(boxes[:, 2:] <= boxes[:, :2]):
+        raise ValueError(f"record {record_id}: boxes must have positive area")
+    if np.any(boxes < 0) or np.any(boxes[:, (0, 2)] > width) or np.any(boxes[:, (1, 3)] > height):
+        raise ValueError(f"record {record_id}: boxes exceed source bounds")
+
+
+def validate_class_ids(record_id: str, classes: np.ndarray, count: int) -> None:
+    """Require one non-negative integer class per box."""
+    if classes.ndim != 1 or len(classes) != count:
+        raise ValueError(f"record {record_id}: box and class lengths must align")
+    if not np.issubdtype(classes.dtype, np.integer):
+        raise ValueError(f"record {record_id}: class IDs must be finite integers")
+    if np.any(classes < 0):
+        raise ValueError(f"record {record_id}: class IDs must be non-negative")
+
+
+def validate_track_ids(record_id: str, tracks: np.ndarray | None, count: int) -> None:
+    """Require one integer track ID per box when tracking annotations are present."""
+    if tracks is None:
+        return
+    if tracks.ndim != 1 or len(tracks) != count:
+        raise ValueError(f"record {record_id}: box and track lengths must align")
+    if not np.issubdtype(tracks.dtype, np.integer):
+        raise ValueError(f"record {record_id}: track IDs must be finite integers")
+
+
 def validate_frame_targets(
     record: VideoRecord,
     targets: tuple[FrameTargets, ...],
@@ -136,8 +169,7 @@ def validate_frame_targets(
     source_size: tuple[int, int],
 ) -> None:
     """Validate canonical annotations against video length and source geometry."""
-    height, width = source_size
-    if height <= 0 or width <= 0:
+    if source_size[0] <= 0 or source_size[1] <= 0:
         raise ValueError("source dimensions must be positive")
     seen: set[int] = set()
     for target in targets:
@@ -145,29 +177,10 @@ def validate_frame_targets(
             raise ValueError(f"record {record.id}: frame index is duplicate or out of range")
         seen.add(target.frame_index)
         boxes = np.asarray(target.boxes_xyxy)
-        classes = np.asarray(target.class_ids)
-        tracks = None if target.track_ids is None else np.asarray(target.track_ids)
-        if boxes.ndim != 2 or boxes.shape[1:] != (4,):
-            raise ValueError(f"record {record.id}: boxes must be shaped [N, 4]")
-        if classes.ndim != 1 or len(classes) != len(boxes):
-            raise ValueError(f"record {record.id}: box and class lengths must align")
-        if not np.issubdtype(classes.dtype, np.integer) or not np.isfinite(classes).all():
-            raise ValueError(f"record {record.id}: class IDs must be finite integers")
-        if np.any(classes < 0):
-            raise ValueError(f"record {record.id}: class IDs must be non-negative")
-        if tracks is not None and (tracks.ndim != 1 or len(tracks) != len(boxes)):
-            raise ValueError(f"record {record.id}: box and track lengths must align")
-        if tracks is not None and (
-            not np.issubdtype(tracks.dtype, np.integer) or not np.isfinite(tracks).all()
-        ):
-            raise ValueError(f"record {record.id}: track IDs must be finite integers")
-        if not np.isfinite(boxes).all():
-            raise ValueError(f"record {record.id}: boxes must be finite")
-        if np.any(boxes[:, 2:] <= boxes[:, :2]):
-            raise ValueError(f"record {record.id}: boxes must have positive area")
-        if (
-            np.any(boxes < 0)
-            or np.any(boxes[:, (0, 2)] > width)
-            or np.any(boxes[:, (1, 3)] > height)
-        ):
-            raise ValueError(f"record {record.id}: boxes exceed source bounds")
+        validate_boxes(record.id, boxes, source_size)
+        validate_class_ids(record.id, np.asarray(target.class_ids), len(boxes))
+        validate_track_ids(
+            record.id,
+            None if target.track_ids is None else np.asarray(target.track_ids),
+            len(boxes),
+        )
