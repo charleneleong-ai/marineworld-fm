@@ -38,14 +38,14 @@ from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.train.naming import metric_name
 from marineworld.train.pretrain import (
     BalancedDatasetSampler,
-    _BalancedSamplerCheckpoint,
-    _build_decoder,
-    _build_module,
-    _prepare_manifest,
-    _training_run_identity,
-    _validate_media_config,
+    BalancedSamplerCheckpoint,
     build_dataloaders,
+    build_decoder,
+    build_module,
+    prepare_training_manifest,
     run_pretraining,
+    training_run_identity,
+    validate_media_config,
     write_training_manifest,
 )
 
@@ -780,7 +780,7 @@ def test_media_config_accepts_boolean_log_media(tmp_path: Path, value: bool) -> 
     cfg = _smoke_config(tmp_path, max_steps=1)
     cfg.tracking.log_media = value
 
-    assert _validate_media_config(cfg) is None
+    assert validate_media_config(cfg) is None
 
 
 def test_wandb_tracking_enables_media_by_default() -> None:
@@ -1170,7 +1170,7 @@ def test_real_smoke_profile_is_bounded_and_online() -> None:
 def test_real_data_uses_portable_video_decoder() -> None:
     cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
 
-    assert isinstance(_build_decoder(cfg), AutoVideoDecoder)
+    assert isinstance(build_decoder(cfg), AutoVideoDecoder)
 
 
 def test_annotated_fvessel_batches_omit_non_collatable_targets(
@@ -1183,7 +1183,7 @@ def test_annotated_fvessel_batches_omit_non_collatable_targets(
     )
     cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
     monkeypatch.setattr(
-        "marineworld.train.pretrain._build_decoder",
+        "marineworld.train.pretrain.build_decoder",
         lambda _: SyntheticVideoDecoder(height=16, width=16),
     )
     monkeypatch.setattr(
@@ -1302,8 +1302,8 @@ def test_default_fvessel_manifest_is_split_by_video_without_overlap(tmp_path: Pa
     adapter, manifest = _fvessel_manifest(tmp_path / "fvessel")
     cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
 
-    first = _prepare_manifest(cfg, manifest)
-    second = _prepare_manifest(cfg, adapter.build_manifest(tmp_path / "fvessel"))
+    first = prepare_training_manifest(cfg, manifest)
+    second = prepare_training_manifest(cfg, adapter.build_manifest(tmp_path / "fvessel"))
 
     first_splits = {
         split: {record.video_path for record in first.records if record.split == split}
@@ -1326,7 +1326,7 @@ def test_small_fvessel_manifest_still_has_train_and_validation(tmp_path: Path, v
     _, manifest = _fvessel_manifest(tmp_path / "fvessel", videos=videos)
     cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
 
-    prepared = _prepare_manifest(cfg, manifest)
+    prepared = prepare_training_manifest(cfg, manifest)
 
     assert {record.split for record in prepared.records} >= {"train", "val"}
 
@@ -1336,7 +1336,7 @@ def test_single_video_cannot_form_train_and_validation_splits(tmp_path: Path) ->
     cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
 
     with pytest.raises(ValueError, match="at least two videos"):
-        _prepare_manifest(cfg, manifest)
+        prepare_training_manifest(cfg, manifest)
 
 
 def test_empty_data_root_fails_before_trainer(
@@ -1418,7 +1418,7 @@ def test_run_pretraining_rejects_invalid_last_checkpoint(
 
     monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: False)
     monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
-    monkeypatch.setattr("marineworld.train.pretrain._build_module", lambda _: object())
+    monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
 
     with pytest.raises(RuntimeError, match=message):
         run_pretraining(_smoke_config(tmp_path, max_steps=2))
@@ -1450,7 +1450,7 @@ def test_run_pretraining_finishes_wandb_before_starting_another_run(
 
     monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", _logger_factory)
     monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
-    monkeypatch.setattr("marineworld.train.pretrain._build_module", lambda _: object())
+    monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
 
     assert run_pretraining(_smoke_config(tmp_path / "success", max_steps=2)).is_file()
     assert not active
@@ -1479,7 +1479,7 @@ def test_wandb_cleanup_does_not_mask_training_failure(
 
     monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: logger)
     monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
-    monkeypatch.setattr("marineworld.train.pretrain._build_module", lambda _: object())
+    monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
 
     with pytest.raises(RuntimeError, match="forced trainer failure"):
         run_pretraining(_smoke_config(tmp_path, max_steps=2))
@@ -1698,10 +1698,10 @@ def test_training_identity_hashes_material_scientific_config(
 ) -> None:
     cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
     first = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
-    baseline = _training_run_identity(cfg, first)
+    baseline = training_run_identity(cfg, first)
     OmegaConf.update(cfg, update, value)
 
-    assert _training_run_identity(cfg, first).condition_id != baseline.condition_id
+    assert training_run_identity(cfg, first).condition_id != baseline.condition_id
 
 
 def test_training_identity_ignores_execution_hardware(tmp_path: Path) -> None:
@@ -1712,8 +1712,8 @@ def test_training_identity_ignores_execution_hardware(tmp_path: Path) -> None:
     a100.runtime.accumulate_grad_batches = l4.runtime.accumulate_grad_batches
 
     assert (
-        _training_run_identity(l4, manifest).condition_id
-        == _training_run_identity(a100, manifest).condition_id
+        training_run_identity(l4, manifest).condition_id
+        == training_run_identity(a100, manifest).condition_id
     )
 
 
@@ -1733,14 +1733,14 @@ def test_training_identity_is_stable_across_resume_horizon(tmp_path: Path) -> No
     )
 
     assert (
-        _training_run_identity(first, manifest).condition_id
-        == _training_run_identity(resumed, manifest, "sha256:resume").condition_id
+        training_run_identity(first, manifest).condition_id
+        == training_run_identity(resumed, manifest, "sha256:resume").condition_id
     )
 
 
 def test_sampler_callback_advances_relative_to_restored_position() -> None:
     sampler = BalancedDatasetSampler(("smd",) * 4 + ("fvessel",) * 4, seed=42)
-    callback = _BalancedSamplerCheckpoint(sampler, batch_size=2)
+    callback = BalancedSamplerCheckpoint(sampler, batch_size=2)
     callback.load_state_dict({"epoch": 0, "position": 4})
 
     callback.on_train_batch_end(None, None, None, None, batch_idx=0)  # type: ignore[arg-type]
@@ -1766,7 +1766,7 @@ def test_joint_split_preserves_each_component_in_training(tmp_path: Path) -> Non
     cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
     cfg.seed = 5
 
-    prepared = _prepare_manifest(cfg, manifest)
+    prepared = prepare_training_manifest(cfg, manifest)
 
     assert {record.dataset for record in prepared.records if record.split == "train"} == {
         "smd",
@@ -1861,7 +1861,7 @@ def test_pretraining_module_receives_configured_warmup(monkeypatch: pytest.Monke
         return object()
 
     monkeypatch.setattr("marineworld.train.pretrain.VideoMAEPretrainingModule", _module_factory)
-    _build_module(cfg)
+    build_module(cfg)
 
     assert captured["warmup_epochs"] == cfg.train.warmup_epochs
 
@@ -1871,4 +1871,4 @@ def test_pretraining_module_rejects_invalid_warmup(warmup_epochs: int) -> None:
     cfg = _compose_config("model=videomae_tiny", f"train.warmup_epochs={warmup_epochs}")
 
     with pytest.raises(ValueError, match="warmup_epochs"):
-        _build_module(cfg)
+        build_module(cfg)

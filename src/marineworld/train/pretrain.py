@@ -44,9 +44,16 @@ from marineworld.utils.seed import seed_everything
 
 __all__ = [
     "BalancedDatasetSampler",
+    "BalancedSamplerCheckpoint",
+    "ExceptionSafeModelCheckpoint",
     "build_dataloaders",
+    "build_decoder",
+    "build_module",
     "build_trainer",
+    "prepare_training_manifest",
     "run_pretraining",
+    "training_run_identity",
+    "validate_media_config",
     "write_training_manifest",
 ]
 
@@ -145,7 +152,7 @@ class BalancedDatasetSampler(Sampler[int]):
         return iter(tuple(draws)[self.position :])
 
 
-class _BalancedSamplerCheckpoint(Callback):
+class BalancedSamplerCheckpoint(Callback):
     """Checkpoint completed samples without observing prefetched iterator yields."""
 
     def __init__(self, sampler: BalancedDatasetSampler, batch_size: int) -> None:
@@ -177,7 +184,7 @@ class _BalancedSamplerCheckpoint(Callback):
         self.base_position = self.sampler.position
 
 
-class _ExceptionSafeModelCheckpoint(ModelCheckpoint):
+class ExceptionSafeModelCheckpoint(ModelCheckpoint):
     """Backport Lightning 2.5's ``save_on_exception`` checkpoint behavior."""
 
     def __init__(self, *, save_on_exception: bool = False, **kwargs: Any) -> None:
@@ -200,7 +207,7 @@ def build_dataloaders(
     manifest: DatasetManifest,
 ) -> dict[str, DataLoader[dict[str, Any]]]:
     """Build train and validation loaders over the shared clip contract."""
-    decoder = _build_decoder(cfg)
+    decoder = build_decoder(cfg)
     common = {
         "manifest": manifest,
         "fingerprint": manifest_checksum(manifest),
@@ -281,18 +288,18 @@ def build_trainer(
 
 def run_pretraining(cfg: DictConfig) -> Path:
     """Train from a composed config and return the last checkpoint path."""
-    _validate_media_config(cfg)
+    validate_media_config(cfg)
     seed_everything(int(cfg.seed))
     adapter = build_data_adapter(cfg.data)
-    manifest = _prepare_manifest(cfg, adapter.build_manifest(Path(cfg.data.root)))
+    manifest = prepare_training_manifest(cfg, adapter.build_manifest(Path(cfg.data.root)))
     dataloaders = build_dataloaders(cfg, manifest)
     checkpoint_provenance = _checkpoint_provenance(cfg.runtime.ckpt_path)
     resolved = resolved_config(cfg)
-    identity = _training_run_identity(cfg, manifest, checkpoint_provenance, resolved)
+    identity = training_run_identity(cfg, manifest, checkpoint_provenance, resolved)
     return _run_with_identity(cfg, manifest, dataloaders, identity, resolved)
 
 
-def _training_run_identity(
+def training_run_identity(
     cfg: DictConfig,
     manifest: DatasetManifest,
     checkpoint_provenance: str | None = None,
@@ -332,7 +339,7 @@ def _run_with_identity(
     resolved: dict[str, Any] | None = None,
 ) -> Path:
     logger = build_wandb_logger(cfg, identity, resolved)
-    checkpoint = _ExceptionSafeModelCheckpoint(
+    checkpoint = ExceptionSafeModelCheckpoint(
         dirpath=Path(cfg.output_dir) / "checkpoints",
         monitor=metric_name("val", "loss"),
         mode="min",
@@ -355,9 +362,9 @@ def _run_with_identity(
         )
         callbacks: list[Callback] = [checkpoint, media]
         if isinstance(sampler, BalancedDatasetSampler):
-            callbacks.append(_BalancedSamplerCheckpoint(sampler, int(cfg.runtime.batch_size)))
+            callbacks.append(BalancedSamplerCheckpoint(sampler, int(cfg.runtime.batch_size)))
         trainer = build_trainer(cfg, logger=logger, callbacks=callbacks)
-        module = _build_module(cfg)
+        module = build_module(cfg)
         trainer.fit(
             module,
             **dataloaders,
@@ -378,7 +385,7 @@ def _run_with_identity(
     return last_checkpoint
 
 
-def _validate_media_config(cfg: DictConfig) -> None:
+def validate_media_config(cfg: DictConfig) -> None:
     if type(cfg.tracking.log_media) is not bool:
         raise ValueError("tracking.log_media must be boolean")
     for key in ("media_log_every_n_epochs", "media_max_frames"):
@@ -460,7 +467,7 @@ def _distributed_context() -> tuple[int, int]:
     return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
 
 
-def _prepare_manifest(cfg: DictConfig, manifest: DatasetManifest) -> DatasetManifest:
+def prepare_training_manifest(cfg: DictConfig, manifest: DatasetManifest) -> DatasetManifest:
     split = cfg.data.get("split")
     if manifest.components and all(record.split == "train" for record in manifest.records):
         grouped: dict[tuple[str, str | None], list[Any]] = {}
@@ -510,14 +517,14 @@ def _pretraining_collate(samples: list[dict[str, Any] | None]) -> dict[str, Any]
     }
 
 
-def _build_decoder(cfg: DictConfig) -> VideoDecoder:
+def build_decoder(cfg: DictConfig) -> VideoDecoder:
     if str(cfg.data.name) == "synthetic" or cfg.data.get("decoder") == "synthetic":
         size = int(cfg.model.image_size)
         return SyntheticVideoDecoder(size, size)
     return AutoVideoDecoder()
 
 
-def _build_module(cfg: DictConfig) -> VideoMAEPretrainingModule:
+def build_module(cfg: DictConfig) -> VideoMAEPretrainingModule:
     model_config = OmegaConf.to_container(cfg.model, resolve=True, throw_on_missing=True)
     if not isinstance(model_config, dict):
         raise TypeError("model config must resolve to a mapping")
