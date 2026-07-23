@@ -23,6 +23,7 @@ from typing import Callable
 
 import numpy as np
 
+from marineworld.data.adapters import resolve_fps, resolve_frame_count
 from marineworld.data.alignment import (
     AISRecord,
     align_tracks_to_frames,
@@ -70,13 +71,19 @@ class FVesselAdapter:
                         f"must contain at least 8 columns"
                     )
                 frame, track_id, left, top, width, height, _, class_id = row[:8]
-                frame_index = _non_negative_integer(frame, "frame", record.annotation_path) - 1
+                frame_index = (
+                    FVesselAdapter.non_negative_integer(frame, "frame", record.annotation_path) - 1
+                )
                 if frame_index < 0:
                     raise ValueError(
                         f"FVessel frame ID in {record.annotation_path} must be a positive integer"
                     )
-                parsed_track_id = _non_negative_integer(track_id, "track", record.annotation_path)
-                parsed_class_id = _non_negative_integer(class_id, "class", record.annotation_path)
+                parsed_track_id = FVesselAdapter.non_negative_integer(
+                    track_id, "track", record.annotation_path
+                )
+                parsed_class_id = FVesselAdapter.non_negative_integer(
+                    class_id, "class", record.annotation_path
+                )
                 frames.setdefault(frame_index, []).append(
                     (
                         [
@@ -101,47 +108,37 @@ class FVesselAdapter:
         )
 
     def _record(self, root: Path, video: Path) -> VideoRecord:
-        annotation = _mot_path(video.parent)
+        annotation = FVesselAdapter.mot_path(video.parent)
         return VideoRecord(
             id=video.relative_to(root).with_suffix("").as_posix(),
             dataset="fvessel",
             video_path=video,
             split="train",
             source=video.parent.name,
-            fps=self._source_fps(video),
-            num_frames=self._source_num_frames(video),
+            fps=resolve_fps(self.fps, video, self.fps_probe, "FVessel"),
+            num_frames=resolve_frame_count(
+                self.num_frames, video, self.frame_count_probe, "FVessel"
+            ),
             annotation_path=annotation,
             metadata={"has_ais": (video.parent / "ais").is_dir()},
         )
 
-    def _source_fps(self, video: Path) -> float:
-        fps = self.fps if self.fps is not None else self.fps_probe(video)
-        if not math.isfinite(fps) or fps <= 0:
-            raise ValueError(f"FVessel FPS must be positive for {video}, got {fps}")
-        return fps
+    @staticmethod
+    def non_negative_integer(value: str, field: str, path: Path) -> int:
+        try:
+            parsed = float(value)
+        except ValueError as error:
+            raise ValueError(
+                f"FVessel {field} ID in {path} must be a finite non-negative integer"
+            ) from error
+        if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+            raise ValueError(f"FVessel {field} ID in {path} must be a finite non-negative integer")
+        return int(parsed)
 
-    def _source_num_frames(self, video: Path) -> int:
-        count = self.num_frames if self.num_frames is not None else self.frame_count_probe(video)
-        if count <= 0:
-            raise ValueError(f"FVessel frame count must be positive, got {count}")
-        return count
-
-
-def _non_negative_integer(value: str, field: str, path: Path) -> int:
-    try:
-        parsed = float(value)
-    except ValueError as error:
-        raise ValueError(
-            f"FVessel {field} ID in {path} must be a finite non-negative integer"
-        ) from error
-    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
-        raise ValueError(f"FVessel {field} ID in {path} must be a finite non-negative integer")
-    return int(parsed)
-
-
-def _mot_path(sample_root: Path) -> Path | None:
-    targets = sorted((sample_root / "gt").glob("*.txt"))
-    return targets[0] if targets else None
+    @staticmethod
+    def mot_path(sample_root: Path) -> Path | None:
+        targets = sorted((sample_root / "gt").glob("*.txt"))
+        return targets[0] if targets else None
 
 
 @dataclass
