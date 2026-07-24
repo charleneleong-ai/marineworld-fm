@@ -66,13 +66,11 @@ from marineworld.eval.probes import (
     supervised_scalar_label,
 )
 from marineworld.eval.run_probes import (
+    ProbeArtifacts,
     ProbeRun,
     _checkpoint_identity,
     _checkpoint_reconstruction_diagnostic,
     _labelled_training_records,
-    _log_diagnostic_artifact,
-    _log_selection_manifest,
-    _prepare_diagnostic_path,
     _prepare_probe_manifest,
     _probe_run_identity,
     has_labelled_splits,
@@ -149,7 +147,7 @@ def test_diagnostic_artifact_hook_logs_local_file(
     )
     logger = SimpleNamespace(experiment=SimpleNamespace(log_artifact=logged.append))
 
-    _log_diagnostic_artifact(path, logger)
+    ProbeArtifacts(path.parent, "run", logger).log_diagnostic(path)
 
     assert logged == [artifact]
 
@@ -158,7 +156,7 @@ def test_diagnostic_path_removes_stale_prior_invocation(tmp_path: Path) -> None:
     stale = tmp_path / "representation_diagnostics.json"
     stale.write_text('{"checkpoint": "old"}')
 
-    path = _prepare_diagnostic_path(tmp_path)
+    path = ProbeArtifacts(tmp_path, "run", False).reserve_diagnostic_path()
 
     assert path == stale
     assert not path.exists()
@@ -1635,7 +1633,7 @@ def test_selection_manifest_logs_as_wandb_artifact(
     )
     logger = SimpleNamespace(experiment=SimpleNamespace(log_artifact=logged.append))
 
-    _log_selection_manifest(path, "run-123", logger)
+    ProbeArtifacts(path.parent, "run-123", logger).log_selection_manifest(path)
 
     assert added == [(str(path), "probe_selection_manifest.json")]
     assert len(logged) == 1
@@ -1648,7 +1646,7 @@ def test_logger_finishes_when_selection_artifact_logging_fails(
     logger = SimpleNamespace(experiment=SimpleNamespace(finish=lambda: finished.append(True)))
     monkeypatch.setattr("marineworld.eval.run_probes.build_wandb_logger", lambda *_: logger)
     monkeypatch.setattr(
-        "marineworld.eval.run_probes._log_selection_manifest",
+        "marineworld.eval.run_probes.ProbeArtifacts.log_selection_manifest",
         lambda *_: (_ for _ in ()).throw(RuntimeError("artifact upload failed")),
     )
 
