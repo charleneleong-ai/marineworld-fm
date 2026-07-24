@@ -121,6 +121,22 @@ def build_wandb_logger(
     )
 
 
+def wandb_artifact_type() -> Any:
+    """Import the W&B Artifact class lazily so disabled tracking stays import-free."""
+    from wandb import Artifact
+
+    return Artifact
+
+
+def log_file_artifact(path: Path, logger: Any, *, name: str, artifact_type: str) -> None:
+    """Attach one file to the run, skipping when tracking cannot accept artifacts."""
+    if logger is False or not hasattr(logger.experiment, "log_artifact"):
+        return
+    artifact = wandb_artifact_type()(name=name, type=artifact_type)
+    artifact.add_file(str(path), name=path.name)
+    logger.experiment.log_artifact(artifact)
+
+
 def _create_wandb_logger(**kwargs: Any) -> WandbLogger:
     """Import Lightning lazily so disabled tracking has no W&B import side effects."""
     from pytorch_lightning.loggers import WandbLogger

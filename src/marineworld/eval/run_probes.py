@@ -46,7 +46,12 @@ from marineworld.eval.probes import (
     nearest_neighbour_diagnostic,
     sample_labelled_records,
 )
-from marineworld.train.experiment import RunIdentity, build_run_identity, build_wandb_logger
+from marineworld.train.experiment import (
+    RunIdentity,
+    build_run_identity,
+    build_wandb_logger,
+    log_file_artifact,
+)
 from marineworld.train.module import VideoMAEPretrainingModule
 from marineworld.utils.seed import seed_everything
 
@@ -229,11 +234,7 @@ def _write_selection_manifest(
 
 
 def _log_selection_manifest(path: Path, run_id: str, logger: Any) -> None:
-    if logger is False:
-        return
-    artifact = _wandb_artifact_type()(name=f"probe-selection-{run_id}", type="dataset")
-    artifact.add_file(str(path), name=path.name)
-    logger.experiment.log_artifact(artifact)
+    log_file_artifact(path, logger, name=f"probe-selection-{run_id}", artifact_type="dataset")
 
 
 def _record_ids_checksum(record_ids: Sequence[str]) -> str:
@@ -584,14 +585,15 @@ def _checkpoint_reconstruction_diagnostic(
 
 
 def _log_diagnostic_artifact(path: Path, logger: Any) -> None:
-    if logger is False or not path.is_file():
+    if not path.is_file():
         return
     provenance = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-    artifact = _wandb_artifact_type()(
-        name=f"representation-diagnostics-{provenance}", type="evaluation"
+    log_file_artifact(
+        path,
+        logger,
+        name=f"representation-diagnostics-{provenance}",
+        artifact_type="evaluation",
     )
-    artifact.add_file(str(path), name=path.name)
-    logger.experiment.log_artifact(artifact)
 
 
 def _prepare_diagnostic_path(output_dir: Path) -> Path:
@@ -946,12 +948,6 @@ def _wandb_table(table: Any) -> Any:
     import wandb
 
     return wandb.Table(dataframe=table)
-
-
-def _wandb_artifact_type() -> Any:
-    import wandb
-
-    return wandb.Artifact
 
 
 @hydra.main(version_base=None, config_path="../../../configs", config_name="config")

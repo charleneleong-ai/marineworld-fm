@@ -146,7 +146,7 @@ def test_diagnostic_artifact_hook_logs_local_file(
     logged: list[object] = []
     artifact = SimpleNamespace(add_file=lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        "marineworld.eval.run_probes._wandb_artifact_type", lambda: lambda **_kwargs: artifact
+        "marineworld.train.experiment.wandb_artifact_type", lambda: lambda **_kwargs: artifact
     )
     logger = SimpleNamespace(experiment=SimpleNamespace(log_artifact=logged.append))
 
@@ -1631,7 +1631,7 @@ def test_selection_manifest_logs_as_wandb_artifact(
     path = tmp_path / "probe_selection_manifest.json"
     path.write_text("{}")
     monkeypatch.setattr(
-        "marineworld.eval.run_probes._wandb_artifact_type",
+        "marineworld.train.experiment.wandb_artifact_type",
         lambda: Artifact,
     )
     logger = SimpleNamespace(experiment=SimpleNamespace(log_artifact=logged.append))

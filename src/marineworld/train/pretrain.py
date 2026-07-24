@@ -35,6 +35,7 @@ from marineworld.train.experiment import (
     RunIdentity,
     build_run_identity,
     build_wandb_logger,
+    log_file_artifact,
     resolved_config,
 )
 from marineworld.train.media import WandbMediaCallback
@@ -436,13 +437,7 @@ def write_training_manifest(manifest: DatasetManifest, output_dir: Path) -> Path
 
 
 def _log_training_manifest(path: Path, run_id: str, logger: Logger | bool) -> None:
-    if logger is False or not hasattr(logger.experiment, "log_artifact"):
-        return
-    from wandb import Artifact
-
-    artifact = Artifact(name=f"training-manifest-{run_id}", type="dataset")
-    artifact.add_file(str(path), name=path.name)
-    logger.experiment.log_artifact(artifact)
+    log_file_artifact(path, logger, name=f"training-manifest-{run_id}", artifact_type="dataset")
 
 
 def _git_sha() -> str | None:
