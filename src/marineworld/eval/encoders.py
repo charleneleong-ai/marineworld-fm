@@ -32,13 +32,6 @@ EncoderCondition = Literal[
     "dinov3",
     "vjepa",
 ]
-MODEL_CONDITIONS: tuple[EncoderCondition, ...] = (
-    "random",
-    "generic_videomae",
-    "maritime_videomae",
-    "dinov3",
-    "vjepa",
-)
 
 
 class ResourceUnavailableError(RuntimeError):
@@ -75,7 +68,7 @@ class FrozenVideoEncoder(Protocol):
     def spatial_transform(self, source_size: tuple[int, int]) -> SpatialTransform: ...
 
 
-class _FrozenTorchEncoder(torch.nn.Module):
+class FrozenEncoder(torch.nn.Module):
     def __init__(
         self,
         model: torch.nn.Module,
@@ -120,7 +113,7 @@ class _FrozenTorchEncoder(torch.nn.Module):
         return _processor_spatial_transform(self.processor, source_size)
 
 
-class VideoMAEFrozenEncoder(_FrozenTorchEncoder):
+class VideoMAEFrozenEncoder(FrozenEncoder):
     """Expose frozen VideoMAE tokens as global and dense features."""
 
     def __init__(
@@ -141,7 +134,7 @@ class VideoMAEFrozenEncoder(_FrozenTorchEncoder):
             return EncoderFeatures(tokens.mean(dim=1).detach(), spatial.detach())
 
 
-class DINOv3FrozenEncoder(_FrozenTorchEncoder):
+class DINOv3FrozenEncoder(FrozenEncoder):
     """Apply a frozen image encoder frame-wise and restore temporal layout."""
 
     def encode(self, pixel_values: torch.Tensor) -> EncoderFeatures:
@@ -163,7 +156,7 @@ class DINOv3FrozenEncoder(_FrozenTorchEncoder):
             return EncoderFeatures(spatial.mean(dim=(1, 2, 3)).detach(), spatial.detach())
 
 
-class VJEPAFrozenEncoder(_FrozenTorchEncoder):
+class VJEPAFrozenEncoder(FrozenEncoder):
     """Expose frozen V-JEPA video tokens through the common feature contract."""
 
     def encode(self, pixel_values: torch.Tensor) -> EncoderFeatures:
@@ -175,6 +168,39 @@ class VJEPAFrozenEncoder(_FrozenTorchEncoder):
             tokens = output.last_hidden_state
             spatial = _reshape_tokens(tokens, self.model.config)
             return EncoderFeatures(tokens.mean(dim=1).detach(), spatial.detach())
+
+
+@dataclass(frozen=True)
+class EncoderSpec:
+    """How one condition builds an encoder, validates weights, and loads a processor."""
+
+    encoder: type[FrozenEncoder]
+    model_type: str | None = None
+    model_loader: str = "AutoModel"
+    processor: str = "AutoVideoProcessor"
+
+
+ENCODER_SPECS: dict[str, EncoderSpec] = {
+    "random": EncoderSpec(encoder=VideoMAEFrozenEncoder),
+    "generic_videomae": EncoderSpec(
+        encoder=VideoMAEFrozenEncoder, model_type="videomae", model_loader="VideoMAEModel"
+    ),
+    "maritime_videomae": EncoderSpec(
+        encoder=VideoMAEFrozenEncoder, model_type="videomae", model_loader="VideoMAEModel"
+    ),
+    "dinov3": EncoderSpec(
+        encoder=DINOv3FrozenEncoder, model_type="dinov3_vit", processor="AutoImageProcessor"
+    ),
+    "vjepa": EncoderSpec(encoder=VJEPAFrozenEncoder, model_type="vjepa2"),
+}
+MODEL_CONDITIONS: tuple[EncoderCondition, ...] = tuple(ENCODER_SPECS)  # type: ignore[assignment]
+
+
+def transformers_class(name: str) -> Any:
+    """Resolve a Transformers class by name, keeping the heavy import lazy."""
+    import transformers
+
+    return getattr(transformers, name)
 
 
 def load_frozen_encoder(
@@ -215,21 +241,9 @@ def load_frozen_encoder(
         allow_download=allow_download,
         revision=revision,
     )
-    if condition in {"generic_videomae", "maritime_videomae"}:
-        return VideoMAEFrozenEncoder(
-            model,
-            name=condition,
-            device=device,
-            processor=processor,
-        )
-    if condition == "dinov3":
-        return DINOv3FrozenEncoder(
-            model,
-            name=condition,
-            device=device,
-            processor=processor,
-        )
-    return VJEPAFrozenEncoder(model, name=condition, device=device, processor=processor)
+    return ENCODER_SPECS[condition].encoder(
+        model, name=condition, device=device, processor=processor
+    )
 
 
 def validate_encoder_request(
@@ -323,19 +337,13 @@ def _validate_local_checkpoint(condition: str, checkpoint: Path) -> None:
 
 
 def _validate_model_config(condition: str, path: Path) -> None:
-    expected_model_types = {
-        "generic_videomae": "videomae",
-        "maritime_videomae": "videomae",
-        "dinov3": "dinov3_vit",
-        "vjepa": "vjepa2",
-    }
     try:
         config = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         raise ValueError(f"invalid config.json in local Hugging Face checkpoint: {path}") from error
     if not isinstance(config, Mapping):
         raise ValueError(f"config.json must contain a JSON mapping: {path}")
-    expected = expected_model_types[condition]
+    expected = ENCODER_SPECS[condition].model_type
     if config.get("model_type") != expected:
         raise ValueError(f"config.json model_type must be {expected!r} for {condition}: {path}")
 
@@ -424,19 +432,9 @@ def _load_pretrained_model(
         )
         return module.model.videomae
 
-    if condition in {"generic_videomae", "maritime_videomae"}:
-        from transformers import VideoMAEModel
-
-        try:
-            return VideoMAEModel.from_pretrained(checkpoint, **pretrained_kwargs)
-        except Exception as error:
-            _raise_known_hub_failure(error, "checkpoint", checkpoint, local_only)
-            raise
-
-    from transformers import AutoModel
-
+    loader = transformers_class(ENCODER_SPECS[condition].model_loader)
     try:
-        return AutoModel.from_pretrained(checkpoint, **pretrained_kwargs)
+        return loader.from_pretrained(checkpoint, **pretrained_kwargs)
     except Exception as error:
         _raise_known_hub_failure(error, "checkpoint", checkpoint, local_only)
         raise
@@ -451,14 +449,7 @@ def _load_pretrained_processor(
 ) -> Any | None:
     if condition == "maritime_videomae" and checkpoint.endswith(".ckpt"):
         return None
-    if condition == "dinov3":
-        from transformers import AutoImageProcessor
-
-        processor_type = AutoImageProcessor
-    else:
-        from transformers import AutoVideoProcessor
-
-        processor_type = AutoVideoProcessor
+    processor_type = transformers_class(ENCODER_SPECS[condition].processor)
     try:
         kwargs: dict[str, Any] = {"local_files_only": not allow_download}
         if revision:
