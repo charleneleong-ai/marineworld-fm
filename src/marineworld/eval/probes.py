@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,8 @@ import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 
-from marineworld.data.contracts import VideoRecord
+from marineworld.data.clips import SpatialTransform
+from marineworld.data.contracts import FrameTargets, VideoRecord
 
 ProbeTask = Literal["classification", "count"]
 ProbeStatus = Literal[
@@ -287,3 +289,75 @@ def _freeze_encoder(encoder: ParameterizedEncoder) -> None:
     for parameter in encoder.parameters():
         parameter.requires_grad_(False)
         parameter.grad = None
+
+
+def dense_token_labels(
+    sample: dict[str, Any],
+    *,
+    spatial_shape: Sequence[int],
+) -> torch.Tensor:
+    temporal_tokens, rows, columns = map(int, spatial_shape)
+    labels = torch.zeros(temporal_tokens, rows, columns, dtype=torch.long)
+    frame_indices = [int(index) for index in sample["frame_indices"]]
+    transform: SpatialTransform = sample["spatial_transform"]
+    targets: Sequence[FrameTargets] = sample["targets"]
+    if not targets and sample["dataset"] == "synthetic":
+        source_height, source_width = transform.source_size
+        targets = tuple(
+            FrameTargets(
+                frame_index=frame_index,
+                boxes_xyxy=np.array(
+                    [[0.0, 0.0, source_width / 2, source_height / 2]],
+                    dtype=np.float32,
+                ),
+                class_ids=np.array([1], dtype=np.int64),
+            )
+            for position, frame_index in enumerate(frame_indices)
+            if position % 2 == 0
+        )
+    frame_positions = {frame_index: position for position, frame_index in enumerate(frame_indices)}
+    output_height, output_width = transform.output_size
+    for target in targets:
+        if target.frame_index not in frame_positions:
+            continue
+        temporal = min(
+            frame_positions[target.frame_index] * temporal_tokens // len(frame_indices),
+            temporal_tokens - 1,
+        )
+        for x1, y1, x2, y2 in transform.apply_boxes_xyxy(target.boxes_xyxy):
+            left = max(0, min(columns, int(np.floor(x1 * columns / output_width))))
+            right = max(0, min(columns, int(np.ceil(x2 * columns / output_width))))
+            top = max(0, min(rows, int(np.floor(y1 * rows / output_height))))
+            bottom = max(0, min(rows, int(np.ceil(y2 * rows / output_height))))
+            if left < right and top < bottom:
+                labels[temporal, top:bottom, left:right] = 1
+    return labels
+
+
+def sample_label(sample: dict[str, Any], task: str) -> int | None:
+    targets: tuple[FrameTargets, ...] = sample["targets"]
+    if not targets and sample["dataset"] == "synthetic":
+        start = int(sample["frame_indices"][0])
+        return (start // len(sample["frame_indices"])) % 2
+    if task == "count":
+        return count_bin(max((len(target.boxes_xyxy) for target in targets), default=0))
+    if task != "classification":
+        raise ValueError(f"unsupported linear probe task: {task}")
+    annotated = [target.class_ids for target in targets if len(target.class_ids)]
+    if not annotated:
+        return None
+    class_ids = np.concatenate(annotated)
+    return Counter(class_ids.tolist()).most_common(1)[0][0]
+
+
+def supervised_scalar_label(sample: dict[str, Any], task: str) -> int | None:
+    if not bool(sample["is_labelled"]):
+        return None
+    return sample_label(sample, task)
+
+
+def count_bin(count: int) -> int:
+    """Map vessel counts to stable 0, 1, 2, and 3+ classes."""
+    if count < 0:
+        raise ValueError("count cannot be negative")
+    return min(count, 3)
