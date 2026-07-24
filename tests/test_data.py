@@ -170,6 +170,18 @@ def test_manifest_checksum_is_portable_and_content_sensitive(tmp_path: Path) -> 
     assert manifest_checksum(manifests[0]) != manifest_checksum(manifests[1])
 
 
+def test_file_checksum_reflects_a_same_size_rewrite_at_one_path(tmp_path: Path) -> None:
+    """A same-size rewrite within the mtime tick must not return a stale digest."""
+    from marineworld.data.manifest import file_checksum
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"content-v1")
+    first = file_checksum(video)
+    video.write_bytes(b"content-v2")  # identical length, immediately
+
+    assert file_checksum(video) != first
+
+
 def test_manifest_checksum_detects_same_size_large_media_mutation(tmp_path: Path) -> None:
     payload = bytearray(b"a" * 1024 * 1024)
     videos = [tmp_path / name / "clip.mp4" for name in ("first", "second")]

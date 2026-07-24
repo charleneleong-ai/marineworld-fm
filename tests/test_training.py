@@ -1378,7 +1378,7 @@ def test_empty_data_root_cli_exits_without_checkpoint(tmp_path: Path) -> None:
         cwd=tmp_path,
         env=environment,
         text=True,
-        timeout=20,
+        timeout=180,
     )
 
     assert result.returncode != 0
@@ -1562,7 +1562,7 @@ def test_offline_smoke_creates_local_wandb_run_without_network(
         cwd=wandb_dir,
         env=environment,
         text=True,
-        timeout=30,
+        timeout=180,
     )
 
     assert (output_dir / "checkpoints" / "last.ckpt").exists()

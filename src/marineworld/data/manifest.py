@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -96,10 +95,15 @@ def content_identity(path: Path) -> str | None:
 
 
 def file_checksum(path: Path) -> str:
-    """Return a content digest that is independent of the file's local path."""
-    canonical = _canonical_path(path)
-    stat = canonical.stat()
-    return cached_file_checksum(canonical, stat.st_size, stat.st_mtime_ns)
+    """Return a content digest that is independent of the file's local path.
+
+    Not memoised on (size, mtime): those collide on a same-size rewrite within the
+    filesystem's mtime resolution, which would return a stale digest for changed
+    content -- wrong for a function whose callers use it to detect that change.
+    Manifest builds avoid re-hashing by sharing one checksum, not by caching here.
+    """
+    with _canonical_path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def directory_checksum(root: Path) -> str:
@@ -115,18 +119,6 @@ def directory_checksum(root: Path) -> str:
         digest.update(len(content_digest).to_bytes(8, "big"))
         digest.update(content_digest)
     return digest.hexdigest()
-
-
-@lru_cache(maxsize=None)
-def cached_file_checksum(path: Path, size: int, modified_ns: int) -> str:
-    """Cache content digests while file size and modification time are unchanged.
-
-    Unbounded because the working set is one entry per corpus file: a fixed bound
-    thrashes, since manifests are rescanned in the same sorted order every pass.
-    """
-    del size, modified_ns
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def validate_boxes(record_id: str, boxes: np.ndarray, source_size: tuple[int, int]) -> None:
