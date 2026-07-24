@@ -6,14 +6,12 @@ import hashlib
 import json
 import math
 import os
-from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import hydra
-import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -21,10 +19,9 @@ from marineworld.data.adapters import DatasetAdapter, build_adapter, build_data_
 from marineworld.data.clips import (
     AutoVideoDecoder,
     MaritimeClipDataset,
-    SpatialTransform,
     SyntheticVideoDecoder,
 )
-from marineworld.data.contracts import DatasetManifest, FrameTargets
+from marineworld.data.contracts import DatasetManifest
 from marineworld.data.manifest import content_identity, manifest_checksum, validate_manifest
 from marineworld.data.splits import SplitUnavailableError, prepare_manifest_splits
 from marineworld.eval.encoders import (
@@ -39,12 +36,14 @@ from marineworld.eval.probes import (
     LabelsUnavailableError,
     ProbeResult,
     aggregate_probe_results,
+    dense_token_labels,
     evaluate_dense_probe_streaming,
     evaluate_probe,
     fit_dense_probe_streaming,
     fit_linear_probe,
     nearest_neighbour_diagnostic,
     sample_labelled_records,
+    supervised_scalar_label,
 )
 from marineworld.train.experiment import (
     RunIdentity,
@@ -724,7 +723,7 @@ def _extract_features(
         labelled = [
             (sample, label)
             for sample in samples
-            if (label := _supervised_scalar_label(sample, str(cfg.eval.task))) is not None
+            if (label := supervised_scalar_label(sample, str(cfg.eval.task))) is not None
         ]
         if not labelled:
             continue
@@ -806,7 +805,7 @@ def _dense_batch_factory(
             spatial = spatial.detach().cpu().clone()
             labels = torch.stack(
                 [
-                    _dense_token_labels(
+                    dense_token_labels(
                         _sample_with_encoder_geometry(sample, encoder),
                         spatial_shape=spatial.shape[1:4],
                     )
@@ -843,71 +842,6 @@ def _sample_with_encoder_geometry(
     return {**sample, "spatial_transform": spatial_transform(transform.source_size)}
 
 
-def _dense_token_labels(
-    sample: dict[str, Any],
-    *,
-    spatial_shape: Sequence[int],
-) -> torch.Tensor:
-    temporal_tokens, rows, columns = map(int, spatial_shape)
-    labels = torch.zeros(temporal_tokens, rows, columns, dtype=torch.long)
-    frame_indices = [int(index) for index in sample["frame_indices"]]
-    transform: SpatialTransform = sample["spatial_transform"]
-    targets: Sequence[FrameTargets] = sample["targets"]
-    if not targets and sample["dataset"] == "synthetic":
-        source_height, source_width = transform.source_size
-        targets = tuple(
-            FrameTargets(
-                frame_index=frame_index,
-                boxes_xyxy=np.array(
-                    [[0.0, 0.0, source_width / 2, source_height / 2]],
-                    dtype=np.float32,
-                ),
-                class_ids=np.array([1], dtype=np.int64),
-            )
-            for position, frame_index in enumerate(frame_indices)
-            if position % 2 == 0
-        )
-    frame_positions = {frame_index: position for position, frame_index in enumerate(frame_indices)}
-    output_height, output_width = transform.output_size
-    for target in targets:
-        if target.frame_index not in frame_positions:
-            continue
-        temporal = min(
-            frame_positions[target.frame_index] * temporal_tokens // len(frame_indices),
-            temporal_tokens - 1,
-        )
-        for x1, y1, x2, y2 in transform.apply_boxes_xyxy(target.boxes_xyxy):
-            left = max(0, min(columns, int(np.floor(x1 * columns / output_width))))
-            right = max(0, min(columns, int(np.ceil(x2 * columns / output_width))))
-            top = max(0, min(rows, int(np.floor(y1 * rows / output_height))))
-            bottom = max(0, min(rows, int(np.ceil(y2 * rows / output_height))))
-            if left < right and top < bottom:
-                labels[temporal, top:bottom, left:right] = 1
-    return labels
-
-
-def _sample_label(sample: dict[str, Any], task: str) -> int | None:
-    targets: tuple[FrameTargets, ...] = sample["targets"]
-    if not targets and sample["dataset"] == "synthetic":
-        start = int(sample["frame_indices"][0])
-        return (start // len(sample["frame_indices"])) % 2
-    if task == "count":
-        return _count_bin(max((len(target.boxes_xyxy) for target in targets), default=0))
-    if task != "classification":
-        raise ValueError(f"unsupported linear probe task: {task}")
-    annotated = [target.class_ids for target in targets if len(target.class_ids)]
-    if not annotated:
-        return None
-    class_ids = np.concatenate(annotated)
-    return Counter(class_ids.tolist()).most_common(1)[0][0]
-
-
-def _supervised_scalar_label(sample: dict[str, Any], task: str) -> int | None:
-    if not bool(sample["is_labelled"]):
-        return None
-    return _sample_label(sample, task)
-
-
 def _labelled_training_records(manifest: DatasetManifest, min_frames: int) -> tuple[Any, ...]:
     return tuple(
         record
@@ -927,13 +861,6 @@ def _subset_metadata(record_ids: Sequence[str] | None) -> dict[str, str | None]:
         "label_subset_checksum": hashlib.sha256(payload.encode()).hexdigest(),
         "labelled_record_ids": payload,
     }
-
-
-def _count_bin(count: int) -> int:
-    """Map vessel counts to stable 0, 1, 2, and 3+ classes."""
-    if count < 0:
-        raise ValueError("count cannot be negative")
-    return min(count, 3)
 
 
 def _checkpoint_identity(checkpoint: str, revision: str | None = None) -> str:

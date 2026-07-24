@@ -52,30 +52,30 @@ from marineworld.eval.probes import (
     LabelsUnavailableError,
     ProbeResult,
     aggregate_probe_results,
+    count_bin,
+    dense_token_labels,
     evaluate_dense_probe_streaming,
     evaluate_probe,
     fit_dense_probe,
     fit_linear_probe,
     masked_reconstruction_diagnostic,
     nearest_neighbour_diagnostic,
+    sample_label,
     sample_labelled_records,
+    supervised_scalar_label,
 )
 from marineworld.eval.run_probes import (
     ProbeRun,
     _build_probe_dataset,
     _checkpoint_identity,
     _checkpoint_reconstruction_diagnostic,
-    _count_bin,
     _dense_batch_factory,
-    _dense_token_labels,
     _labelled_training_records,
     _log_diagnostic_artifact,
     _log_selection_manifest,
     _prepare_diagnostic_path,
     _prepare_probe_manifest,
     _probe_run_identity,
-    _sample_label,
-    _supervised_scalar_label,
     has_labelled_splits,
     log_probe_results,
     run_evaluation,
@@ -1756,7 +1756,7 @@ def test_classification_ignores_frames_without_class_annotations() -> None:
         ),
     }
 
-    assert _sample_label(sample, "classification") is None
+    assert sample_label(sample, "classification") is None
 
 
 def test_count_probe_excludes_unlabelled_real_clips() -> None:
@@ -1767,13 +1767,13 @@ def test_count_probe_excludes_unlabelled_real_clips() -> None:
         "is_labelled": False,
     }
 
-    assert _supervised_scalar_label(sample, "count") is None
-    assert _supervised_scalar_label(sample | {"is_labelled": True}, "count") == 0
+    assert supervised_scalar_label(sample, "count") is None
+    assert supervised_scalar_label(sample | {"is_labelled": True}, "count") == 0
 
 
 @pytest.mark.parametrize(("count", "expected"), [(0, 0), (1, 1), (2, 2), (3, 3), (12, 3)])
 def test_count_probe_uses_documented_three_plus_bin(count: int, expected: int) -> None:
-    assert _count_bin(count) == expected
+    assert count_bin(count) == expected
 
 
 def test_probe_manifest_splits_real_train_only_records_by_video(tmp_path: Path) -> None:
@@ -1908,7 +1908,7 @@ def test_single_class_subset_is_reported_without_numeric_result(
                 f"data.root={tmp_path / 'data'}",
             ],
         )
-    monkeypatch.setattr("marineworld.eval.run_probes._sample_label", lambda *_: 0)
+    monkeypatch.setattr("marineworld.eval.probes.sample_label", lambda *_: 0)
 
     results = run_evaluation(cfg)
 
@@ -2204,7 +2204,7 @@ def test_dense_labels_map_source_boxes_to_spatiotemporal_tokens() -> None:
         ),
     }
 
-    labels = _dense_token_labels(sample, spatial_shape=(2, 2, 2))
+    labels = dense_token_labels(sample, spatial_shape=(2, 2, 2))
 
     assert labels.tolist() == [
         [[1, 0], [0, 0]],
