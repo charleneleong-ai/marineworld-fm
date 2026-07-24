@@ -69,6 +69,8 @@ class FrozenVideoEncoder(Protocol):
 
 
 class FrozenEncoder(torch.nn.Module):
+    """Shared frozen-backbone behaviour: device placement, preprocessing, geometry."""
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -108,9 +110,60 @@ class FrozenEncoder(torch.nn.Module):
     def spatial_transform(self, source_size: tuple[int, int]) -> SpatialTransform:
         """Return the processor's resize/center-crop geometry for dense labels."""
         if self.processor is None:
-            height, width = source_size
             return SpatialTransform(source_size, source_size, (1.0, 1.0))
-        return _processor_spatial_transform(self.processor, source_size)
+        return self.processor_spatial_transform(self.processor, source_size)
+
+    @staticmethod
+    def reshape_tokens(tokens: torch.Tensor, config: Any) -> torch.Tensor:
+        frames = int(getattr(config, "num_frames", getattr(config, "frames_per_clip", 0)))
+        if not frames:
+            raise ValueError("encoder config must define num_frames or frames_per_clip")
+        temporal = frames // int(getattr(config, "tubelet_size", 1))
+        image_size = getattr(config, "image_size", getattr(config, "crop_size", None))
+        if image_size is None:
+            raise ValueError("encoder config must define image_size or crop_size")
+        image_height, image_width = pair(image_size)
+        patch_height, patch_width = pair(config.patch_size)
+        rows, columns = image_height // patch_height, image_width // patch_width
+        expected = temporal * rows * columns
+        if tokens.shape[1] != expected:
+            raise ValueError(f"expected {expected} spatial tokens, got {tokens.shape[1]}")
+        return tokens.reshape(tokens.shape[0], temporal, rows, columns, tokens.shape[-1])
+
+    @staticmethod
+    def processor_spatial_transform(
+        processor: Any,
+        source_size: tuple[int, int],
+    ) -> SpatialTransform:
+        source_height, source_width = source_size
+        resized_height, resized_width = source_size
+        if getattr(processor, "do_resize", True):
+            size = processor.size
+            height = getattr(size, "height", None)
+            width = getattr(size, "width", None)
+            shortest = getattr(size, "shortest_edge", None)
+            if height is not None and width is not None:
+                resized_height, resized_width = int(height), int(width)
+            elif shortest is not None:
+                scale = float(shortest) / min(source_size)
+                resized_height = int(source_height * scale)
+                resized_width = int(source_width * scale)
+            else:
+                raise ValueError("processor resize size must define height/width or shortest_edge")
+        output_height, output_width = resized_height, resized_width
+        offset_y = offset_x = 0.0
+        if getattr(processor, "do_center_crop", False):
+            crop = processor.crop_size
+            output_height = int(crop.height)
+            output_width = int(crop.width)
+            offset_y = -float(max(0, (resized_height - output_height) // 2))
+            offset_x = -float(max(0, (resized_width - output_width) // 2))
+        return SpatialTransform(
+            source_size=source_size,
+            output_size=(output_height, output_width),
+            scale=(resized_height / source_height, resized_width / source_width),
+            offset=(offset_y, offset_x),
+        )
 
 
 class VideoMAEFrozenEncoder(FrozenEncoder):
@@ -130,7 +183,7 @@ class VideoMAEFrozenEncoder(FrozenEncoder):
     def encode(self, pixel_values: torch.Tensor) -> EncoderFeatures:
         with torch.inference_mode():
             tokens = self.model(pixel_values=self.prepare(pixel_values)).last_hidden_state
-            spatial = _reshape_tokens(tokens, self.model.config)
+            spatial = self.reshape_tokens(tokens, self.model.config)
             return EncoderFeatures(tokens.mean(dim=1).detach(), spatial.detach())
 
 
@@ -142,18 +195,31 @@ class DINOv3FrozenEncoder(FrozenEncoder):
         with torch.inference_mode():
             images = pixel_values.reshape(batch_size * frames, channels, height, width)
             if callable(self.processor):
-                processed = self.processor(
-                    [image.cpu() for image in images],
-                    return_tensors="pt",
-                    do_rescale=False,
-                )
-                images = processed["pixel_values"].to(self.device)
+                images = self.prepare(images)
             else:
                 prepared = self.prepare(pixel_values)
                 images = prepared.reshape(batch_size * frames, channels, height, width)
             tokens = self.model(pixel_values=images).last_hidden_state
-            spatial = _reshape_image_tokens(tokens, self.model.config, frames, batch_size)
+            spatial = self.reshape_image_tokens(tokens, self.model.config, frames, batch_size)
             return EncoderFeatures(spatial.mean(dim=(1, 2, 3)).detach(), spatial.detach())
+
+    @staticmethod
+    def reshape_image_tokens(
+        tokens: torch.Tensor,
+        config: Any,
+        frames: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        image_height, image_width = pair(config.image_size)
+        patch_height, patch_width = pair(config.patch_size)
+        rows, columns = image_height // patch_height, image_width // patch_width
+        patch_tokens = rows * columns
+        if tokens.shape[1] < patch_tokens:
+            raise ValueError(
+                f"expected at least {patch_tokens} image tokens, got {tokens.shape[1]}"
+            )
+        tokens = tokens[:, -patch_tokens:]
+        return tokens.reshape(batch_size, frames, rows, columns, tokens.shape[-1])
 
 
 class VJEPAFrozenEncoder(FrozenEncoder):
@@ -166,7 +232,7 @@ class VJEPAFrozenEncoder(FrozenEncoder):
                 skip_predictor=True,
             )
             tokens = output.last_hidden_state
-            spatial = _reshape_tokens(tokens, self.model.config)
+            spatial = self.reshape_tokens(tokens, self.model.config)
             return EncoderFeatures(tokens.mean(dim=1).detach(), spatial.detach())
 
 
@@ -193,7 +259,15 @@ ENCODER_SPECS: dict[str, EncoderSpec] = {
     ),
     "vjepa": EncoderSpec(encoder=VJEPAFrozenEncoder, model_type="vjepa2"),
 }
-MODEL_CONDITIONS: tuple[EncoderCondition, ...] = tuple(ENCODER_SPECS)  # type: ignore[assignment]
+MODEL_CONDITIONS: tuple[EncoderCondition, ...] = tuple(ENCODER_SPECS)
+
+
+def from_pretrained_kwargs(local_only: bool, revision: str | None) -> dict[str, Any]:
+    """Build the Hub download options shared by model and processor loading."""
+    kwargs: dict[str, Any] = {"local_files_only": local_only}
+    if revision:
+        kwargs["revision"] = revision
+    return kwargs
 
 
 def transformers_class(name: str) -> Any:
@@ -352,7 +426,6 @@ def _validate_safetensors(path: Path) -> None:
     try:
         with safe_open(path, framework="pt", device="cpu") as weights:
             keys = list(weights.keys())
-            weights.metadata()
     except (OSError, SafetensorError) as error:
         raise ValueError(f"invalid safetensors weight container: {path}") from error
     if not keys:
@@ -417,9 +490,6 @@ def _load_pretrained_model(
     revision: str | None,
 ) -> torch.nn.Module:
     local_only = not allow_download
-    pretrained_kwargs: dict[str, Any] = {"local_files_only": local_only}
-    if revision:
-        pretrained_kwargs["revision"] = revision
     if condition == "maritime_videomae" and checkpoint.endswith(".ckpt"):
         if model_config is None:
             raise ValueError("Lightning maritime checkpoints require model_config")
@@ -434,7 +504,7 @@ def _load_pretrained_model(
 
     loader = transformers_class(ENCODER_SPECS[condition].model_loader)
     try:
-        return loader.from_pretrained(checkpoint, **pretrained_kwargs)
+        return loader.from_pretrained(checkpoint, **from_pretrained_kwargs(local_only, revision))
     except Exception as error:
         _raise_known_hub_failure(error, "checkpoint", checkpoint, local_only)
         raise
@@ -451,9 +521,7 @@ def _load_pretrained_processor(
         return None
     processor_type = transformers_class(ENCODER_SPECS[condition].processor)
     try:
-        kwargs: dict[str, Any] = {"local_files_only": not allow_download}
-        if revision:
-            kwargs["revision"] = revision
+        kwargs = from_pretrained_kwargs(not allow_download, revision)
         return processor_type.from_pretrained(checkpoint, **kwargs)
     except Exception as error:
         _raise_known_hub_failure(error, "processor", checkpoint, not allow_download)
@@ -466,7 +534,7 @@ def _raise_known_hub_failure(
     checkpoint: str,
     local_only: bool,
 ) -> None:
-    errors = tuple(_exception_chain(error))
+    errors = _exception_chain(error)
     if any(_is_hard_hub_error(item) for item in errors):
         return
     remote_cache_miss = (
@@ -552,74 +620,6 @@ def _is_cache_miss_os_error(error: Exception) -> bool:
             "couldn't connect",
             "offline mode",
         )
-    )
-
-
-def _reshape_tokens(tokens: torch.Tensor, config: Any) -> torch.Tensor:
-    frames = int(getattr(config, "num_frames", getattr(config, "frames_per_clip", 0)))
-    if not frames:
-        raise ValueError("encoder config must define num_frames or frames_per_clip")
-    temporal = frames // int(getattr(config, "tubelet_size", 1))
-    image_size = getattr(config, "image_size", getattr(config, "crop_size", None))
-    if image_size is None:
-        raise ValueError("encoder config must define image_size or crop_size")
-    image_height, image_width = pair(image_size)
-    patch_height, patch_width = pair(config.patch_size)
-    rows, columns = image_height // patch_height, image_width // patch_width
-    expected = temporal * rows * columns
-    if tokens.shape[1] != expected:
-        raise ValueError(f"expected {expected} spatial tokens, got {tokens.shape[1]}")
-    return tokens.reshape(tokens.shape[0], temporal, rows, columns, tokens.shape[-1])
-
-
-def _reshape_image_tokens(
-    tokens: torch.Tensor,
-    config: Any,
-    frames: int,
-    batch_size: int,
-) -> torch.Tensor:
-    image_height, image_width = pair(config.image_size)
-    patch_height, patch_width = pair(config.patch_size)
-    rows, columns = image_height // patch_height, image_width // patch_width
-    patch_tokens = rows * columns
-    if tokens.shape[1] < patch_tokens:
-        raise ValueError(f"expected at least {patch_tokens} image tokens, got {tokens.shape[1]}")
-    tokens = tokens[:, -patch_tokens:]
-    return tokens.reshape(batch_size, frames, rows, columns, tokens.shape[-1])
-
-
-def _processor_spatial_transform(
-    processor: Any,
-    source_size: tuple[int, int],
-) -> SpatialTransform:
-    source_height, source_width = source_size
-    resized_height, resized_width = source_size
-    if getattr(processor, "do_resize", True):
-        size = processor.size
-        height = getattr(size, "height", None)
-        width = getattr(size, "width", None)
-        shortest = getattr(size, "shortest_edge", None)
-        if height is not None and width is not None:
-            resized_height, resized_width = int(height), int(width)
-        elif shortest is not None:
-            scale = float(shortest) / min(source_size)
-            resized_height = int(source_height * scale)
-            resized_width = int(source_width * scale)
-        else:
-            raise ValueError("processor resize size must define height/width or shortest_edge")
-    output_height, output_width = resized_height, resized_width
-    offset_y = offset_x = 0.0
-    if getattr(processor, "do_center_crop", False):
-        crop = processor.crop_size
-        output_height = int(crop.height)
-        output_width = int(crop.width)
-        offset_y = -float(max(0, (resized_height - output_height) // 2))
-        offset_x = -float(max(0, (resized_width - output_width) // 2))
-    return SpatialTransform(
-        source_size=source_size,
-        output_size=(output_height, output_width),
-        scale=(resized_height / source_height, resized_width / source_width),
-        offset=(offset_y, offset_x),
     )
 
 
