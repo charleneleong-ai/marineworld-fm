@@ -48,6 +48,7 @@ from marineworld.eval.encoders import (
     VJEPAFrozenEncoder,
     load_frozen_encoder,
 )
+from marineworld.eval.features import build_probe_dataset, dense_batch_factory
 from marineworld.eval.probes import (
     LabelsUnavailableError,
     ProbeResult,
@@ -66,10 +67,8 @@ from marineworld.eval.probes import (
 )
 from marineworld.eval.run_probes import (
     ProbeRun,
-    _build_probe_dataset,
     _checkpoint_identity,
     _checkpoint_reconstruction_diagnostic,
-    _dense_batch_factory,
     _labelled_training_records,
     _log_diagnostic_artifact,
     _log_selection_manifest,
@@ -88,7 +87,7 @@ from marineworld.train.module import VideoMAEPretrainingModule
 def test_probe_dataset_decodes_with_backend_fallback(tmp_path: Path) -> None:
     """Eval must survive a decord-hostile stream the training path already survives."""
     from marineworld.data.clips import AutoVideoDecoder
-    from marineworld.eval.run_probes import _build_probe_dataset
+    from marineworld.eval.run_probes import build_probe_dataset
 
     cfg = _probe_config(tmp_path, "eval.optional=true")
     manifest = SyntheticAdapter(version="v", num_videos=2, num_frames=8).build_manifest(
@@ -97,7 +96,7 @@ def test_probe_dataset_decodes_with_backend_fallback(tmp_path: Path) -> None:
     manifest = dataclasses.replace(manifest, name="fvessel")
 
     adapter = SyntheticAdapter(version="v", num_videos=2, num_frames=8)
-    dataset = _build_probe_dataset(cfg, manifest, adapter, object(), split="train")
+    dataset = build_probe_dataset(cfg, manifest, adapter, object(), split="train")
 
     assert isinstance(dataset.decoder, AutoVideoDecoder)
 
@@ -203,7 +202,7 @@ def test_processorless_probe_uses_training_normalization(tmp_path: Path) -> None
     adapter = SyntheticAdapter(num_frames=4, num_videos=2)
     manifest = adapter.build_manifest(tmp_path / "data")
 
-    sample = _build_probe_dataset(cfg, manifest, adapter, FakeEncoder(), split="train")[0]
+    sample = build_probe_dataset(cfg, manifest, adapter, FakeEncoder(), split="train")[0]
 
     assert sample["pixel_values"][0, 0, 0, 0].item() == pytest.approx(-0.485 / 0.229)
 
@@ -221,21 +220,21 @@ def test_final_scalar_probe_keeps_selected_train_subset(
     )
     manifest = DatasetManifest("synthetic", "1", "MIT", records)
     sets = {
-        "train": probe_runner._FeatureSet(
+        "train": probe_runner.FeatureSet(
             torch.eye(3),
             torch.tensor([0, 1, 0]),
             ("train-a", "train-b", "train-c"),
             ("generated",) * 3,
             ("synthetic",) * 3,
         ),
-        "val": probe_runner._FeatureSet(
+        "val": probe_runner.FeatureSet(
             torch.eye(2, 3),
             torch.tensor([0, 1]),
             ("val-a", "val-b"),
             ("generated",) * 2,
             ("synthetic",) * 2,
         ),
-        "test": probe_runner._FeatureSet(
+        "test": probe_runner.FeatureSet(
             torch.eye(2, 3),
             torch.tensor([0, 1]),
             ("test-a", "test-b"),
@@ -243,7 +242,7 @@ def test_final_scalar_probe_keeps_selected_train_subset(
             ("synthetic",) * 2,
         ),
     }
-    monkeypatch.setattr(probe_runner, "_extract_features", lambda *_args, split, **_kw: sets[split])
+    monkeypatch.setattr(probe_runner, "extract_features", lambda *_args, split, **_kw: sets[split])
     fit_sizes: list[int] = []
     fitted = object()
     monkeypatch.setattr(
@@ -295,11 +294,11 @@ def test_dense_selected_train_head_reports_heldout_test(
             for split in ("train", "val", "test")
         ),
     )
-    monkeypatch.setattr(probe_runner, "_build_probe_dataset", lambda *_args, split, **_kw: split)
+    monkeypatch.setattr(probe_runner, "build_probe_dataset", lambda *_args, split, **_kw: split)
     selected_sets: list[set[str] | None] = []
     monkeypatch.setattr(
         probe_runner,
-        "_dense_batch_factory",
+        "dense_batch_factory",
         lambda _dataset, _encoder, *, record_ids=None, **_kw: (
             selected_sets.append(record_ids) or (lambda: iter(()))
         ),
@@ -1840,7 +1839,7 @@ def test_dense_batches_exclude_unlabelled_real_clips() -> None:
         def __getitem__(self, index: int) -> dict[str, Any]:
             return sample
 
-    assert list(_dense_batch_factory(DatasetStub(), DenseFakeEncoder(), batch_size=1)()) == []
+    assert list(dense_batch_factory(DatasetStub(), DenseFakeEncoder(), batch_size=1)()) == []
 
 
 def test_result_table_preserves_label_subset_membership() -> None:
