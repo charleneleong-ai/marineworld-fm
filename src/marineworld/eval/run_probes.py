@@ -69,6 +69,80 @@ class ProbeRun:
     selected_record_ids: tuple[str, ...] | None = None
 
 
+class ProbeArtifacts:
+    """Write and log the files a probe run leaves behind, under one run identity."""
+
+    def __init__(self, output_dir: Path, run_id: str, logger: Any) -> None:
+        self.output_dir = output_dir
+        self.run_id = run_id
+        self.logger = logger
+
+    def write_selection_manifest(
+        self,
+        manifest: DatasetManifest,
+        runs: Sequence[ProbeRun],
+    ) -> Path:
+        """Persist exact split membership and label subsets even when W&B is disabled."""
+        split_ids = {
+            split: sorted(record.id for record in manifest.records if record.split == split)
+            for split in ("train", "val", "test")
+        }
+        payload = {
+            "dataset": manifest.name,
+            "manifest_checksum": manifest_checksum(manifest),
+            "splits": {
+                split: {
+                    "record_ids": record_ids,
+                    "checksum": _record_ids_checksum(record_ids),
+                }
+                for split, record_ids in split_ids.items()
+            },
+            "label_subsets": [
+                {
+                    "fraction": run.fraction,
+                    "seed": run.seed,
+                    "record_ids": (
+                        list(run.selected_record_ids)
+                        if run.selected_record_ids is not None
+                        else None
+                    ),
+                    "checksum": (
+                        _record_ids_checksum(run.selected_record_ids)
+                        if run.selected_record_ids is not None
+                        else None
+                    ),
+                }
+                for run in runs
+            ],
+        }
+        path = self.output_dir / "probe_selection_manifest.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return path
+
+    def log_selection_manifest(self, path: Path) -> None:
+        log_file_artifact(
+            path, self.logger, name=f"probe-selection-{self.run_id}", artifact_type="dataset"
+        )
+
+    def log_diagnostic(self, path: Path) -> None:
+        if not path.is_file():
+            return
+        provenance = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        log_file_artifact(
+            path,
+            self.logger,
+            name=f"representation-diagnostics-{provenance}",
+            artifact_type="evaluation",
+        )
+
+    def reserve_diagnostic_path(self) -> Path:
+        """Reserve this invocation's diagnostic path, removing any stale predecessor."""
+        path = self.output_dir / "representation_diagnostics.json"
+        path.unlink(missing_ok=True)
+        return path
+
+
 def run_probe_condition(
     run: ProbeRun,
     *,
@@ -142,10 +216,10 @@ def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
     )
     identity = _probe_run_identity(cfg, manifest, checkpoint_ref, revision)
     logger = build_wandb_logger(_tracking_config(cfg), identity)
-    diagnostic_path = _prepare_diagnostic_path(Path(cfg.output_dir))
+    artifacts = ProbeArtifacts(Path(cfg.output_dir), identity.run_id, logger)
+    diagnostic_path = artifacts.reserve_diagnostic_path()
     try:
-        selection_path = _write_selection_manifest(cfg, manifest, runs)
-        _log_selection_manifest(selection_path, identity.run_id, logger)
+        artifacts.log_selection_manifest(artifacts.write_selection_manifest(manifest, runs))
         if split_error is not None or not has_labelled_splits(manifest, int(cfg.model.num_frames)):
             results = tuple(probe_result(run, "SKIPPED_UNAVAILABLE_LABELS") for run in runs)
             log_probe_results(results, logger)
@@ -165,7 +239,7 @@ def run_evaluation(cfg: DictConfig) -> tuple[ProbeResult, ...]:
             results = tuple(probe_result(run, "SKIPPED_RESOURCE") for run in runs)
         log_probe_results(results, logger)
         if diagnostic_path.is_file():
-            _log_diagnostic_artifact(diagnostic_path, logger)
+            artifacts.log_diagnostic(diagnostic_path)
         return results
     finally:
         if logger is not False:
@@ -177,52 +251,6 @@ def log_probe_results(results: Sequence[ProbeResult], logger: Any) -> None:
     if logger is False:
         return
     logger.experiment.log({"probe/results": _wandb_table(aggregate_probe_results(results))})
-
-
-def _write_selection_manifest(
-    cfg: DictConfig,
-    manifest: DatasetManifest,
-    runs: Sequence[ProbeRun],
-) -> Path:
-    """Persist exact split membership and label subsets even when W&B is disabled."""
-    split_ids = {
-        split: sorted(record.id for record in manifest.records if record.split == split)
-        for split in ("train", "val", "test")
-    }
-    payload = {
-        "dataset": manifest.name,
-        "manifest_checksum": manifest_checksum(manifest),
-        "splits": {
-            split: {
-                "record_ids": record_ids,
-                "checksum": _record_ids_checksum(record_ids),
-            }
-            for split, record_ids in split_ids.items()
-        },
-        "label_subsets": [
-            {
-                "fraction": run.fraction,
-                "seed": run.seed,
-                "record_ids": (
-                    list(run.selected_record_ids) if run.selected_record_ids is not None else None
-                ),
-                "checksum": (
-                    _record_ids_checksum(run.selected_record_ids)
-                    if run.selected_record_ids is not None
-                    else None
-                ),
-            }
-            for run in runs
-        ],
-    }
-    path = Path(cfg.output_dir) / "probe_selection_manifest.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    return path
-
-
-def _log_selection_manifest(path: Path, run_id: str, logger: Any) -> None:
-    log_file_artifact(path, logger, name=f"probe-selection-{run_id}", artifact_type="dataset")
 
 
 def _record_ids_checksum(record_ids: Sequence[str]) -> str:
@@ -570,25 +598,6 @@ def _checkpoint_reconstruction_diagnostic(
         "masked_tokens": int(mask.sum()),
         "clips": 1,
     }
-
-
-def _log_diagnostic_artifact(path: Path, logger: Any) -> None:
-    if not path.is_file():
-        return
-    provenance = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-    log_file_artifact(
-        path,
-        logger,
-        name=f"representation-diagnostics-{provenance}",
-        artifact_type="evaluation",
-    )
-
-
-def _prepare_diagnostic_path(output_dir: Path) -> Path:
-    """Reserve this invocation's diagnostic path, removing any stale predecessor."""
-    path = output_dir / "representation_diagnostics.json"
-    path.unlink(missing_ok=True)
-    return path
 
 
 def _evaluate_dense_runs(
