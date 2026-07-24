@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -16,34 +16,32 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from marineworld.data.adapters import DatasetAdapter, build_adapter, build_data_adapter
-from marineworld.data.clips import (
-    AutoVideoDecoder,
-    MaritimeClipDataset,
-    SyntheticVideoDecoder,
-)
 from marineworld.data.contracts import DatasetManifest
 from marineworld.data.manifest import content_identity, manifest_checksum, validate_manifest
 from marineworld.data.splits import SplitUnavailableError, prepare_manifest_splits
 from marineworld.eval.encoders import (
-    EncoderFeatures,
     FrozenVideoEncoder,
     ResourceUnavailableError,
     load_frozen_encoder,
     validate_encoder_request,
+)
+from marineworld.eval.features import (
+    FeatureSet,
+    build_probe_dataset,
+    dense_batch_factory,
+    extract_features,
 )
 from marineworld.eval.probes import (
     DegenerateLabelsError,
     LabelsUnavailableError,
     ProbeResult,
     aggregate_probe_results,
-    dense_token_labels,
     evaluate_dense_probe_streaming,
     evaluate_probe,
     fit_dense_probe_streaming,
     fit_linear_probe,
     nearest_neighbour_diagnostic,
     sample_labelled_records,
-    supervised_scalar_label,
 )
 from marineworld.train.experiment import (
     RunIdentity,
@@ -69,15 +67,6 @@ class ProbeRun:
     device: str
     optional: bool = False
     selected_record_ids: tuple[str, ...] | None = None
-
-
-@dataclass(frozen=True)
-class _FeatureSet:
-    features: torch.Tensor
-    labels: torch.Tensor
-    record_ids: tuple[str, ...]
-    sources: tuple[str, ...]
-    datasets: tuple[str, ...]
 
 
 def run_probe_condition(
@@ -408,8 +397,8 @@ def _evaluate_runs(
     if str(cfg.eval.task) == "dense":
         return _evaluate_dense_runs(cfg, manifest, adapter, encoder, runs)
     try:
-        train = _extract_features(cfg, manifest, adapter, encoder, split="train")
-        validation = _extract_features(cfg, manifest, adapter, encoder, split="val")
+        train = extract_features(cfg, manifest, adapter, encoder, split="train")
+        validation = extract_features(cfg, manifest, adapter, encoder, split="val")
     except LabelsUnavailableError:
         return tuple(probe_result(run, "SKIPPED_UNAVAILABLE_LABELS") for run in runs)
     if validation.labels.unique().numel() < 2:
@@ -465,7 +454,7 @@ def _evaluate_runs(
         if not bool(cfg.eval.get("report_test", False)) or not test_records:
             continue
         try:
-            test = _extract_features(cfg, manifest, adapter, encoder, split="test")
+            test = extract_features(cfg, manifest, adapter, encoder, split="test")
         except LabelsUnavailableError:
             continue
         final_probe = probe
@@ -492,7 +481,7 @@ def _evaluate_runs(
     return tuple(results)
 
 
-def smd_source_results(run: ProbeRun, probe: Any, test: _FeatureSet) -> list[ProbeResult]:
+def smd_source_results(run: ProbeRun, probe: Any, test: FeatureSet) -> list[ProbeResult]:
     """Score each SMD capture source separately so domain shift is visible per subset."""
     rows: list[ProbeResult] = []
     pairs = list(zip(test.datasets, test.sources, strict=True))
@@ -518,8 +507,8 @@ def smd_source_results(run: ProbeRun, probe: Any, test: _FeatureSet) -> list[Pro
 def _write_representation_diagnostics(
     cfg: DictConfig,
     run: ProbeRun,
-    references: _FeatureSet,
-    queries: _FeatureSet,
+    references: FeatureSet,
+    queries: FeatureSet,
     manifest: DatasetManifest,
     adapter: DatasetAdapter,
     encoder: FrozenVideoEncoder,
@@ -566,7 +555,7 @@ def _checkpoint_reconstruction_diagnostic(
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     module.load_state_dict(payload["state_dict"])
     module.eval()
-    dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split="val")
+    dataset = build_probe_dataset(cfg, manifest, adapter, encoder, split="val")
     if not len(dataset):
         raise LabelsUnavailableError("masked reconstruction requires a validation clip")
     pixels = dataset[0]["pixel_values"].unsqueeze(0)
@@ -609,9 +598,9 @@ def _evaluate_dense_runs(
     encoder: FrozenVideoEncoder,
     runs: Sequence[ProbeRun],
 ) -> tuple[ProbeResult, ...]:
-    train_dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split="train")
-    validation_dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split="val")
-    validation_batches = _dense_batch_factory(
+    train_dataset = build_probe_dataset(cfg, manifest, adapter, encoder, split="train")
+    validation_dataset = build_probe_dataset(cfg, manifest, adapter, encoder, split="val")
+    validation_batches = dense_batch_factory(
         validation_dataset,
         encoder,
         batch_size=int(cfg.eval.batch_size),
@@ -619,7 +608,7 @@ def _evaluate_dense_runs(
     results = []
     for run in runs:
         selected = set(run.selected_record_ids)
-        train_batches = _dense_batch_factory(
+        train_batches = dense_batch_factory(
             train_dataset,
             encoder,
             batch_size=int(cfg.eval.batch_size),
@@ -651,8 +640,8 @@ def _evaluate_dense_runs(
         results.append(probe_result(run, "COMPLETED", metric=metric, value=value))
         has_test_records = any(record.split == "test" for record in manifest.records)
         if bool(cfg.eval.get("report_test", False)) and has_test_records:
-            test_dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split="test")
-            test_batches = _dense_batch_factory(
+            test_dataset = build_probe_dataset(cfg, manifest, adapter, encoder, split="test")
+            test_batches = dense_batch_factory(
                 test_dataset,
                 encoder,
                 batch_size=int(cfg.eval.batch_size),
@@ -698,148 +687,6 @@ def probe_result(
         device=run.device,
         **_subset_metadata(run.selected_record_ids),
     )
-
-
-def _extract_features(
-    cfg: DictConfig,
-    manifest: DatasetManifest,
-    adapter: DatasetAdapter,
-    encoder: FrozenVideoEncoder,
-    *,
-    split: str,
-) -> _FeatureSet:
-    dataset = _build_probe_dataset(cfg, manifest, adapter, encoder, split=split)
-    feature_batches: list[torch.Tensor] = []
-    label_batches: list[torch.Tensor] = []
-    record_ids: list[str] = []
-    sources: list[str] = []
-    datasets: list[str] = []
-    batch_size = int(cfg.eval.batch_size)
-    if batch_size <= 0:
-        raise ValueError("probe batch_size must be positive")
-    for start in range(0, len(dataset), batch_size):
-        decoded = [dataset[index] for index in range(start, min(start + batch_size, len(dataset)))]
-        samples = [sample for sample in decoded if sample is not None]
-        labelled = [
-            (sample, label)
-            for sample in samples
-            if (label := supervised_scalar_label(sample, str(cfg.eval.task))) is not None
-        ]
-        if not labelled:
-            continue
-        samples, scalar_labels = zip(*labelled, strict=True)
-        if not samples:
-            continue
-        encoded = _encode_samples(encoder, samples)
-        feature_batches.append(encoded.global_features.cpu())
-        label_batches.append(torch.tensor(scalar_labels, dtype=torch.long))
-        record_ids.extend(str(sample["record_id"]) for sample in samples)
-        sources.extend(str(sample["source"]) for sample in samples)
-        datasets.extend(str(sample["dataset"]) for sample in samples)
-    if not feature_batches:
-        raise LabelsUnavailableError(f"{split} split produced no labelled probe clips")
-    return _FeatureSet(
-        torch.cat(feature_batches),
-        torch.cat(label_batches),
-        tuple(record_ids),
-        tuple(sources),
-        tuple(datasets),
-    )
-
-
-def _build_probe_dataset(
-    cfg: DictConfig,
-    manifest: DatasetManifest,
-    adapter: DatasetAdapter,
-    encoder: FrozenVideoEncoder,
-    *,
-    split: str,
-) -> MaritimeClipDataset:
-    size = int(cfg.model.image_size)
-    processor_owns_geometry = getattr(encoder, "processor", None) is not None
-    decoder = (
-        SyntheticVideoDecoder(size, size) if manifest.name == "synthetic" else AutoVideoDecoder()
-    )
-    return MaritimeClipDataset(
-        manifest,
-        decoder,
-        split=split,
-        frames=int(cfg.model.num_frames),
-        stride=1,
-        image_size=None if processor_owns_geometry else size,
-        seed=int(cfg.seed),
-        target_loader=adapter.load_targets,
-        normalization_mean=(
-            tuple(cfg.data.transforms.normalization.mean) if not processor_owns_geometry else None
-        ),
-        normalization_std=(
-            tuple(cfg.data.transforms.normalization.std) if not processor_owns_geometry else None
-        ),
-    )
-
-
-def _dense_batch_factory(
-    dataset: MaritimeClipDataset,
-    encoder: FrozenVideoEncoder,
-    *,
-    batch_size: int,
-    record_ids: set[str] | None = None,
-) -> Callable[[], Iterator[tuple[torch.Tensor, torch.Tensor]]]:
-    if batch_size <= 0:
-        raise ValueError("probe batch_size must be positive")
-
-    def batches() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        for start in range(0, len(dataset), batch_size):
-            samples = [
-                dataset[index]
-                for index in range(start, min(start + batch_size, len(dataset)))
-                if record_ids is None or dataset.clips[index].record_id in record_ids
-            ]
-            samples = [sample for sample in samples if bool(sample["is_labelled"])]
-            if not samples:
-                continue
-            with torch.inference_mode():
-                spatial = _encode_samples(encoder, samples).spatial_features
-            if spatial is None:
-                raise ValueError("dense probe requires encoder spatial features")
-            spatial = spatial.detach().cpu().clone()
-            labels = torch.stack(
-                [
-                    dense_token_labels(
-                        _sample_with_encoder_geometry(sample, encoder),
-                        spatial_shape=spatial.shape[1:4],
-                    )
-                    for sample in samples
-                ]
-            )
-            yield spatial, labels
-
-    return batches
-
-
-def _encode_samples(
-    encoder: FrozenVideoEncoder,
-    samples: Sequence[dict[str, Any]],
-) -> EncoderFeatures:
-    if getattr(encoder, "processor", None) is None:
-        return encoder.encode(torch.stack([sample["pixel_values"] for sample in samples]))
-    encoded = [encoder.encode(sample["pixel_values"].unsqueeze(0)) for sample in samples]
-    global_features = torch.cat([features.global_features for features in encoded])
-    spatial_batches = [features.spatial_features for features in encoded]
-    spatial = None
-    if all(features is not None for features in spatial_batches):
-        spatial = torch.cat([features for features in spatial_batches if features is not None])
-    return EncoderFeatures(global_features, spatial)
-
-
-def _sample_with_encoder_geometry(
-    sample: dict[str, Any], encoder: FrozenVideoEncoder
-) -> dict[str, Any]:
-    transform = sample["spatial_transform"]
-    spatial_transform = getattr(encoder, "spatial_transform", None)
-    if not callable(spatial_transform) or getattr(encoder, "processor", None) is None:
-        return sample
-    return {**sample, "spatial_transform": spatial_transform(transform.source_size)}
 
 
 def _labelled_training_records(manifest: DatasetManifest, min_frames: int) -> tuple[Any, ...]:
