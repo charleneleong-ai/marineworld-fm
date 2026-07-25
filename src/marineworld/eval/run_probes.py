@@ -460,24 +460,7 @@ def _evaluate_runs(
             validation.labels,
             task=run.task,
         )
-        results.append(
-            ProbeResult(
-                condition=run.condition,
-                checkpoint=run.checkpoint,
-                manifest_checksum=run.manifest_checksum,
-                dataset=run.dataset,
-                task=run.task,
-                fraction=run.fraction,
-                seed=run.seed,
-                metric=metric,
-                value=value,
-                status="COMPLETED",
-                model=run.model,
-                device=run.device,
-                evaluation_split="val",
-                **_subset_metadata(run.selected_record_ids),
-            )
-        )
+        results.append(probe_result(run, "COMPLETED", metric=metric, value=value))
         test_records = [record for record in manifest.records if record.split == "test"]
         if not bool(cfg.eval.get("report_test", False)) or not test_records:
             continue
@@ -485,27 +468,14 @@ def _evaluate_runs(
             test = extract_features(cfg, manifest, adapter, encoder, split="test")
         except LabelsUnavailableError:
             continue
-        final_probe = probe
-        metric, value = evaluate_probe(final_probe, test.features, test.labels, task=run.task)
+        metric, value = evaluate_probe(probe, test.features, test.labels, task=run.task)
         results.append(
-            ProbeResult(
-                condition=run.condition,
-                checkpoint=run.checkpoint,
-                manifest_checksum=run.manifest_checksum,
-                dataset=run.dataset,
-                task=run.task,
-                fraction=run.fraction,
-                seed=run.seed,
-                metric=metric,
-                value=value,
-                status="COMPLETED",
-                model=run.model,
-                device=run.device,
+            replace(
+                probe_result(run, "COMPLETED", metric=metric, value=value),
                 evaluation_split="test",
-                **_subset_metadata(run.selected_record_ids),
             )
         )
-        results.extend(smd_source_results(run, final_probe, test))
+        results.extend(smd_source_results(run, probe, test))
     return tuple(results)
 
 
