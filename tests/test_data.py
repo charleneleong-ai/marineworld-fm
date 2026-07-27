@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import zipfile
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import NoReturn
@@ -25,6 +26,7 @@ from marineworld.data.clips import (
     SpatialTransform,
     SyntheticVideoDecoder,
     build_clip_index,
+    drop_undecodable,
 )
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 from marineworld.data.download import app as download_app
@@ -704,6 +706,54 @@ def test_frame_count_trusts_metadata_when_the_tail_decodes(
 
     assert video_module.probe_video_frame_count(video) == 100
     assert checked == [99]
+
+
+class _HoleDecoder:
+    """Decode everything except an interior region, as damaged H.264 streams do."""
+
+    def __init__(self, dead: range) -> None:
+        self.dead = dead
+
+    def decode(self, record: VideoRecord, frame_indices: Sequence[int]) -> torch.Tensor:
+        if any(index in self.dead for index in frame_indices):
+            raise RuntimeError(f"could not decode frames from {record.video_path}")
+        return torch.zeros((len(frame_indices), 3, 8, 8))
+
+
+def test_dataset_drops_clips_it_cannot_decode_instead_of_failing_the_run(
+    synthetic_manifest: DatasetManifest,
+) -> None:
+    """Damage is not always a suffix, so a run must survive an interior hole."""
+    dataset = MaritimeClipDataset(
+        synthetic_manifest,
+        _HoleDecoder(range(4, 8)),
+        split="train",
+        frames=2,
+        stride=1,
+        image_size=8,
+        seed=42,
+    )
+
+    samples = [dataset[index] for index in range(len(dataset))]
+
+    assert any(sample is None for sample in samples), "expected the damaged clips to drop"
+    assert any(sample is not None for sample in samples), "expected intact clips to survive"
+    assert dataset.decode_failures
+    assert all(failure.record_id for failure in dataset.decode_failures)
+
+
+def test_collate_drops_undecodable_samples_but_refuses_an_empty_batch() -> None:
+    """Dropping is data loss, so a batch with nothing left must be loud."""
+    good = {
+        "pixel_values": torch.zeros((2, 3, 8, 8)),
+        "dataset": "demo",
+        "record_id": "a",
+        "source": "s",
+    }
+
+    assert drop_undecodable([good, None, good]) == [good, good]
+    with pytest.raises(ValueError, match="every clip in the batch failed to decode"):
+        drop_undecodable([None, None])
 
 
 def test_auto_decoder_prefers_decord(

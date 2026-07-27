@@ -26,6 +26,7 @@ from marineworld.data.clips import (
     SampleDraw,
     SyntheticVideoDecoder,
     VideoDecoder,
+    drop_undecodable,
 )
 from marineworld.data.contracts import DatasetManifest
 from marineworld.data.manifest import file_checksum, manifest_checksum
@@ -498,8 +499,9 @@ def _prepare_manifest(cfg: DictConfig, manifest: DatasetManifest) -> DatasetMani
     )
 
 
-def _pretraining_collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
+def _pretraining_collate(samples: list[dict[str, Any] | None]) -> dict[str, Any]:
     """Stack only model inputs; annotations are not part of SSL pretraining."""
+    samples = drop_undecodable(samples)
     return {
         "pixel_values": torch.stack([sample["pixel_values"] for sample in samples]),
         "dataset": tuple(sample["dataset"] for sample in samples),
