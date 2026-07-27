@@ -672,6 +672,40 @@ def test_decord_decoder_missing_dependency_explains_supported_fallback(
         DecordVideoDecoder().decode(record, (0,))
 
 
+def test_frame_count_reflects_frames_that_actually_decode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Container metadata overreports damaged H.264 tails; clips must not span them."""
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    monkeypatch.setattr(
+        video_module, "probe_video", lambda _: video_module.VideoMetadata(frame_count=100, fps=25.0)
+    )
+    # the reported tail does not decode, so the stream is counted for real
+    monkeypatch.setattr(video_module, "_decord_can_seek", lambda _path, index: index < 90)
+    monkeypatch.setattr(video_module, "count_decodable_frames", lambda _path: 90)
+
+    assert video_module.probe_video_frame_count(video) == 90
+
+
+def test_frame_count_trusts_metadata_when_the_tail_decodes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An intact video must cost exactly one verification decode, not a bisect."""
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    checked: list[int] = []
+    monkeypatch.setattr(
+        video_module, "probe_video", lambda _: video_module.VideoMetadata(frame_count=100, fps=25.0)
+    )
+    monkeypatch.setattr(
+        video_module, "_decord_can_seek", lambda _p, index: checked.append(index) or True
+    )
+
+    assert video_module.probe_video_frame_count(video) == 100
+    assert checked == [99]
+
+
 def test_auto_decoder_prefers_decord(
     synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
