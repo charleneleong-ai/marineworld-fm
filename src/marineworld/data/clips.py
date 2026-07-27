@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -86,6 +87,23 @@ class DecordVideoDecoder:
         except Exception as error:
             raise RuntimeError(f"could not decode frames from {record.video_path}") from error
         return torch.from_numpy(frames).permute(0, 3, 1, 2)
+
+
+@dataclass(frozen=True)
+class ClipDecodeFailure:
+    """One clip that could not be decoded, retained so losses can be reported."""
+
+    record_id: str
+    frame_indices: tuple[int, ...]
+    reason: str
+
+
+def drop_undecodable(samples: Sequence[dict[str, Any] | None]) -> list[dict[str, Any]]:
+    """Filter clips that failed to decode, refusing a batch with nothing left."""
+    kept = [sample for sample in samples if sample is not None]
+    if not kept:
+        raise ValueError("every clip in the batch failed to decode")
+    return kept
 
 
 class AutoVideoDecoder:
@@ -190,18 +208,24 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         self.normalization_std = normalization_std
         self.color_jitter = color_jitter if split == "train" else 0.0
         self.seed = seed
+        self.decode_failures: list[ClipDecodeFailure] = []
+        self._warned_records: set[str] = set()
         self._targets_by_record: dict[str, tuple[FrameTargets, ...]] = {}
         self._validated_target_records: set[str] = set()
 
     def __len__(self) -> int:
         return len(self.clips)
 
-    def __getitem__(self, index: int | SampleDraw) -> dict[str, Any]:
+    def __getitem__(self, index: int | SampleDraw) -> dict[str, Any] | None:
         augmentation_seed = index.augmentation_seed if isinstance(index, SampleDraw) else None
         index = index.index if isinstance(index, SampleDraw) else index
         clip = self.clips[index]
         record = self.records[clip.record_id]
-        frames = self.decoder.decode(record, clip.frame_indices)
+        try:
+            frames = self.decoder.decode(record, clip.frame_indices)
+        except (RuntimeError, ValueError) as error:
+            self._record_decode_failure(clip, str(error))
+            return None
         expected_frames = len(clip.frame_indices)
         actual_frames = frames.shape[0] if frames.ndim else 0
         if actual_frames != expected_frames:
@@ -223,6 +247,18 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
             "is_labelled": record.dataset == "synthetic" or record.annotation_path is not None,
             "spatial_transform": transform,
         }
+
+    def _record_decode_failure(self, clip: ClipIndex, reason: str) -> None:
+        self.decode_failures.append(
+            ClipDecodeFailure(
+                record_id=clip.record_id, frame_indices=clip.frame_indices, reason=reason
+            )
+        )
+        if clip.record_id not in self._warned_records:
+            self._warned_records.add(clip.record_id)
+            warnings.warn(
+                f"dropping undecodable clips from {clip.record_id}: {reason}", stacklevel=2
+            )
 
     def spatial_transform(self, frames: torch.Tensor) -> SpatialTransform:
         if frames.ndim != 4 or frames.shape[1] != 3:
