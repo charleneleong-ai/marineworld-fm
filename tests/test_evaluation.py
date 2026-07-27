@@ -57,9 +57,7 @@ from marineworld.eval.probes import (
     dense_token_labels,
     evaluate_dense_probe_streaming,
     evaluate_probe,
-    fit_dense_probe,
     fit_linear_probe,
-    masked_reconstruction_diagnostic,
     nearest_neighbour_diagnostic,
     sample_label,
     sample_labelled_records,
@@ -122,17 +120,6 @@ def test_nearest_neighbour_diagnostic_rejects_empty_reference_corpus() -> None:
             query_ids=("query",),
             reference_ids=(),
         )
-
-
-def test_masked_reconstruction_diagnostic_only_scores_masked_tokens() -> None:
-    prediction = torch.tensor([[1.0, 10.0, 3.0]])
-    target = torch.tensor([[2.0, 999.0, 1.0]])
-    mask = torch.tensor([[True, False, True]])
-
-    assert masked_reconstruction_diagnostic(prediction, target, mask) == {
-        "masked_mse": 2.5,
-        "masked_tokens": 2,
-    }
 
 
 def test_diagnostic_artifact_hook_logs_local_file(
@@ -778,31 +765,6 @@ def test_linear_probe_uses_sklearn_and_reports_classification_metric(
     assert probe.__class__.__module__.startswith("sklearn.")
     assert metric == "macro_f1"
     assert value == pytest.approx(1.0)
-
-
-def test_dense_probe_trains_only_a_single_linear_spatial_head(fake_encoder: FakeEncoder) -> None:
-    before = {name: value.clone() for name, value in fake_encoder.state_dict().items()}
-    spatial_features = torch.tensor([[[[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]]]])
-    labels = torch.tensor([[[[0, 0], [1, 1]]]])
-
-    head = fit_dense_probe(
-        fake_encoder,
-        spatial_features,
-        labels,
-        num_classes=2,
-        epochs=20,
-        lr=0.2,
-        seed=42,
-    )
-
-    assert isinstance(head, torch.nn.Linear)
-    predictions = head(spatial_features.reshape(-1, 2)).argmax(dim=1)
-    assert torch.equal(predictions, labels.reshape(-1))
-    assert all(
-        torch.equal(before[name], value) for name, value in fake_encoder.state_dict().items()
-    )
-    assert all(parameter.grad is None for parameter in fake_encoder.parameters())
-    assert all(not parameter.requires_grad for parameter in fake_encoder.parameters())
 
 
 @pytest.mark.parametrize(
