@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import tomllib
 import zipfile
@@ -82,6 +83,23 @@ from marineworld.eval.run_probes import (
 )
 from marineworld.train.experiment import build_run_identity
 from marineworld.train.module import VideoMAEPretrainingModule
+
+
+def test_probe_dataset_decodes_with_backend_fallback(tmp_path: Path) -> None:
+    """Eval must survive a decord-hostile stream the training path already survives."""
+    from marineworld.data.clips import AutoVideoDecoder
+    from marineworld.eval.run_probes import _build_probe_dataset
+
+    cfg = _probe_config(tmp_path, "eval.optional=true")
+    manifest = SyntheticAdapter(version="v", num_videos=2, num_frames=8).build_manifest(
+        tmp_path / "unused"
+    )
+    manifest = dataclasses.replace(manifest, name="fvessel")
+
+    adapter = SyntheticAdapter(version="v", num_videos=2, num_frames=8)
+    dataset = _build_probe_dataset(cfg, manifest, adapter, object(), split="train")
+
+    assert isinstance(dataset.decoder, AutoVideoDecoder)
 
 
 def test_nearest_neighbour_diagnostic_is_bounded_and_reports_matches() -> None:

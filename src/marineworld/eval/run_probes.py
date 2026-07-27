@@ -19,7 +19,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from marineworld.data.adapters import DatasetAdapter, build_adapter, build_data_adapter
 from marineworld.data.clips import (
-    DecordVideoDecoder,
+    AutoVideoDecoder,
     MaritimeClipDataset,
     SpatialTransform,
     SyntheticVideoDecoder,
@@ -766,7 +766,7 @@ def _build_probe_dataset(
     size = int(cfg.model.image_size)
     processor_owns_geometry = getattr(encoder, "processor", None) is not None
     decoder = (
-        SyntheticVideoDecoder(size, size) if manifest.name == "synthetic" else DecordVideoDecoder()
+        SyntheticVideoDecoder(size, size) if manifest.name == "synthetic" else AutoVideoDecoder()
     )
     return MaritimeClipDataset(
         manifest,

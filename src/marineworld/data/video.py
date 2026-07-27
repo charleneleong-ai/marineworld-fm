@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -39,9 +40,49 @@ def probe_video(path: Path) -> VideoMetadata:
     raise RuntimeError("video probing requires optional dependency 'decord' or 'PyAV'")
 
 
+def count_decodable_frames(path: Path) -> int:
+    """Count frames by decoding the stream once, ignoring container metadata."""
+    stat = path.stat()
+    return _cached_decodable_frames(path, stat.st_size, stat.st_mtime_ns)
+
+
+@lru_cache(maxsize=None)
+def _cached_decodable_frames(path: Path, size: int, modified_ns: int) -> int:
+    del size, modified_ns
+    av = _import_pyav()
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        return sum(1 for _ in container.decode(stream))
+
+
+def _decord_can_seek(path: Path, index: int) -> bool:
+    """Seek one frame with Decord, which is O(1) rather than a sequential walk."""
+    try:
+        from decord import VideoReader
+    except ImportError:
+        return False
+    try:
+        VideoReader(str(path)).get_batch([index])
+    except Exception:
+        return False
+    return True
+
+
 def probe_video_frame_count(path: Path) -> int:
-    """Return a source video's positive frame count."""
-    return probe_video(path).frame_count
+    """Return the number of frames that actually decode.
+
+    Container metadata overreports damaged or truncated H.264 streams, so trusting
+    it yields clips over frames that do not exist.
+
+    The reported tail is checked with a Decord seek, which is cheap. Falling back to
+    PyAV here would cost a full sequential walk *before* counting, so a damaged video
+    would pay two passes instead of one. A Decord failure therefore only means "count
+    it properly", never "this frame is unreachable" -- the count is the authority.
+    """
+    reported = probe_video(path).frame_count
+    if _decord_can_seek(path, reported - 1):
+        return reported
+    return count_decodable_frames(path)
 
 
 def probe_video_fps(path: Path) -> float:
