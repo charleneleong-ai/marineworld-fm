@@ -98,7 +98,8 @@ def test_linear_interpolation_is_weighted_not_just_midpoint():
 
 
 def test_course_interpolation_wraps_around_zero():
-    # 350 deg -> 10 deg shortest arc crosses 0, midpoint should be 0 (=360).
+    # 350 deg -> 10 deg shortest arc crosses 0, midpoint should be 0 (=360), not
+    # the naive linear mean of 180 -- this is the circular-interpolation regression guard.
     track = _track(
         [
             {"Timestamp": 1000, "Course": 350.0},
@@ -109,18 +110,6 @@ def test_course_interpolation_wraps_around_zero():
     ang = rec.course
     # Accept 0 or 360 representation.
     assert min(ang, 360.0 - ang) == pytest.approx(0.0, abs=1e-6)
-
-
-def test_naive_average_would_be_wrong_for_angles():
-    # Guard against a linear-average regression: naive mean of 350 and 10 is 180.
-    track = _track(
-        [
-            {"Timestamp": 1000, "Course": 350.0},
-            {"Timestamp": 2000, "Course": 10.0},
-        ]
-    )
-    rec = track.query(1500, method="linear")
-    assert not (170.0 < rec.course < 190.0)
 
 
 def test_heading_na_sentinel_becomes_nan():

@@ -365,33 +365,23 @@ def test_fvessel_parses_mot_targets(tmp_path: Path) -> None:
     assert targets[0].track_ids.tolist() == [7]
 
 
-def test_fvessel_rejects_truncated_mot_rows(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ("1,7,10\n", "MOT row 1"),
+        ("1,1.5,10,20,30,40,1,1\n", "finite non-negative integer"),
+        ("1,nan,10,20,30,40,1,1\n", "finite non-negative integer"),
+        ("1,-1,10,20,30,40,1,1\n", "finite non-negative integer"),
+        ("0,1,10,20,30,40,1,1\n", "positive integer"),
+    ],
+)
+def test_fvessel_rejects_malformed_mot_rows(tmp_path: Path, row: str, message: str) -> None:
     adapter, root = _fvessel_adapter(tmp_path)
     record = adapter.build_manifest(root).records[0]
     assert record.annotation_path is not None
-    record.annotation_path.write_text("1,7,10\n")
+    record.annotation_path.write_text(row)
 
-    with pytest.raises(ValueError, match="MOT row 1"):
-        adapter.load_targets(record)
-
-
-@pytest.mark.parametrize("value", ["1.5", "nan", "-1"])
-def test_fvessel_rejects_invalid_integer_identifiers(tmp_path: Path, value: str) -> None:
-    adapter, root = _fvessel_adapter(tmp_path)
-    record = adapter.build_manifest(root).records[0]
-    assert record.annotation_path is not None
-    record.annotation_path.write_text(f"1,{value},10,20,30,40,1,1\n")
-
-    with pytest.raises(ValueError, match="finite non-negative integer"):
-        adapter.load_targets(record)
-
-
-def test_fvessel_rejects_zero_native_frame_id(tmp_path: Path) -> None:
-    adapter, root = _fvessel_adapter(tmp_path)
-    record = adapter.build_manifest(root).records[0]
-    assert record.annotation_path is not None
-    record.annotation_path.write_text("0,1,10,20,30,40,1,1\n")
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match=message):
         adapter.load_targets(record)
 
 
