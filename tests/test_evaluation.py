@@ -6,10 +6,11 @@ import dataclasses
 import json
 import tomllib
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import numpy as np
 import pytest
@@ -392,6 +393,14 @@ def _write_hf_config(checkpoint: Path, model_type: str = "videomae") -> None:
     (checkpoint / "config.json").write_text(json.dumps({"model_type": model_type}))
 
 
+def _write_torch_state_dict(checkpoint: Path) -> None:
+    torch.save({"weight": torch.ones(1)}, checkpoint / "pytorch_model.bin")
+
+
+def _write_safetensors(checkpoint: Path) -> None:
+    save_file({"weight": torch.ones(1)}, checkpoint / "model.safetensors")
+
+
 def _set_local_reference(cfg: Any, checkpoint: Path) -> None:
     OmegaConf.update(cfg, "model.condition", "generic_videomae")
     OmegaConf.update(cfg, "eval.checkpoint", str(checkpoint))
@@ -408,9 +417,9 @@ def _hub_error(kind: str) -> Exception:
     return HfHubHTTPError("service unavailable", response=response)
 
 
-def _optional_reference_run() -> ProbeRun:
+def _optional_reference_run(condition: str = "generic_videomae") -> ProbeRun:
     return ProbeRun(
-        condition="generic_videomae",
+        condition=condition,
         checkpoint="org/reference@revision",
         manifest_checksum="fixture-checksum",
         dataset="fixture",
@@ -857,54 +866,23 @@ def test_optional_resource_failure_during_evaluation_is_skipped(
     assert results[0].value is None
 
 
-def test_optional_reference_does_not_swallow_arbitrary_runtime_errors(
-    fake_encoder: FakeEncoder,
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("model implementation bug"),
+        PermissionError("annotation denied"),
+    ],
+)
+def test_optional_reference_does_not_swallow_non_resource_errors(
+    fake_encoder: FakeEncoder, error: Exception
 ) -> None:
-    run = ProbeRun(
-        condition="dinov3",
-        checkpoint="cached/reference",
-        manifest_checksum="fixture-checksum",
-        dataset="fixture",
-        task="classification",
-        fraction=0.1,
-        seed=42,
-        metric="macro_f1",
-        model="dinov3",
-        device="cpu",
-        optional=True,
-    )
+    run = _optional_reference_run(condition="dinov3")
 
-    with pytest.raises(RuntimeError, match="model implementation bug"):
-        run_probe_condition(
-            run,
-            loader=lambda: fake_encoder,
-            evaluator=lambda _: (_ for _ in ()).throw(RuntimeError("model implementation bug")),
-        )
+    def failing_evaluator(_: object) -> NoReturn:
+        raise error
 
-
-def test_optional_reference_does_not_swallow_evaluation_os_errors(
-    fake_encoder: FakeEncoder,
-) -> None:
-    run = ProbeRun(
-        condition="dinov3",
-        checkpoint="cached/reference",
-        manifest_checksum="fixture-checksum",
-        dataset="fixture",
-        task="classification",
-        fraction=0.1,
-        seed=42,
-        metric="macro_f1",
-        model="dinov3",
-        device="cpu",
-        optional=True,
-    )
-
-    with pytest.raises(PermissionError, match="annotation denied"):
-        run_probe_condition(
-            run,
-            loader=lambda: fake_encoder,
-            evaluator=lambda _: (_ for _ in ()).throw(PermissionError("annotation denied")),
-        )
+    with pytest.raises(type(error), match=str(error)):
+        run_probe_condition(run, loader=lambda: fake_encoder, evaluator=failing_evaluator)
 
 
 def test_pretrained_loading_is_cache_only_unless_download_is_explicit(
@@ -1395,12 +1373,15 @@ def test_encoder_preflight_rejects_junk_pytorch_zip(
         run_evaluation(cfg)
 
 
-def test_encoder_preflight_accepts_minimal_torch_state_dict(tmp_path: Path) -> None:
+@pytest.mark.parametrize("write_weights", [_write_torch_state_dict, _write_safetensors])
+def test_encoder_preflight_accepts_valid_local_checkpoint(
+    tmp_path: Path, write_weights: Callable[[Path], None]
+) -> None:
     cfg = _unlabelled_smd_probe_config(tmp_path)
-    checkpoint = tmp_path / "valid-pytorch-state-dict"
+    checkpoint = tmp_path / "valid-checkpoint"
     checkpoint.mkdir()
     _write_hf_config(checkpoint)
-    torch.save({"weight": torch.ones(1)}, checkpoint / "pytorch_model.bin")
+    write_weights(checkpoint)
     _set_local_reference(cfg, checkpoint)
 
     results = run_evaluation(cfg)
@@ -1424,19 +1405,6 @@ def test_encoder_preflight_rejects_malformed_weight_index(
 
     with pytest.raises(ValueError, match="invalid Hugging Face weight index"):
         run_evaluation(cfg)
-
-
-def test_encoder_preflight_accepts_minimal_valid_local_hf_fixture(tmp_path: Path) -> None:
-    cfg = _unlabelled_smd_probe_config(tmp_path)
-    checkpoint = tmp_path / "valid-save-pretrained"
-    checkpoint.mkdir()
-    _write_hf_config(checkpoint)
-    save_file({"weight": torch.ones(1)}, checkpoint / "model.safetensors")
-    _set_local_reference(cfg, checkpoint)
-
-    results = run_evaluation(cfg)
-
-    assert results[0].status == "SKIPPED_UNAVAILABLE_LABELS"
 
 
 def test_encoder_preflight_rejects_unrelated_safetensors_file(
@@ -1515,9 +1483,7 @@ def test_encoder_preflight_accepts_symlinked_sharded_hf_snapshot(tmp_path: Path)
     (checkpoint / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"layer.weight": shard_name}})
     )
-    OmegaConf.update(cfg, "model.condition", "generic_videomae")
-    OmegaConf.update(cfg, "eval.checkpoint", str(checkpoint))
-    OmegaConf.update(cfg, "model.revision", None, force_add=True)
+    _set_local_reference(cfg, checkpoint)
 
     results = run_evaluation(cfg)
 
