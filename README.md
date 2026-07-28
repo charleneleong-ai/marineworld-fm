@@ -8,12 +8,17 @@ The thesis: start one layer *below* VLAs at **multisensory physical-state repres
 
 | Version | Scope | Status |
 | --- | --- | --- |
-| v0 | Scaffold, data adapters, AIS temporal alignment, seeding, tests | current |
-| v1 | VideoMAE-style video SSL pretraining + few-shot detection/tracking eval | planned |
+| v0 | Scaffold, data adapters, AIS temporal alignment, seeding, tests | done |
+| v1 | VideoMAE-style video SSL pretraining + frozen-encoder representation probes | done |
 | v2 | Video + AIS fusion (cross-modal objectives) on FVessel | planned |
 | v3 | + radar / NIR modalities | planned |
 | v4 | Temporal world model: predict future latent state | planned |
 | v5 | Action-conditioned world model `(z_t, a_t) -> z_{t+1}` | planned |
+
+v1 is on `main`: VideoMAE pretraining (single-dataset and balanced joint SMD+FVessel),
+frozen-encoder probes across five encoder conditions, W&B experiment tracking with
+reconstruction previews, and a GitHub Actions CI that runs lint, a ruff complexity
+gate, and the full test suite on every pull request.
 
 ## Datasets
 
@@ -27,33 +32,41 @@ Video and AIS are **not** on a shared clock. FVessel AIS is asynchronously times
 
 ```text
 marineworld-fm/
-  pyproject.toml          # core + [train] + [dev] dependency groups
-  mise.toml               # tool versions + tasks (setup/test/lint)
-  .pre-commit-config.yaml # ruff + hygiene + fast tests on push
-  configs/                # hydra configs (data / model / train)
+  pyproject.toml          # core + [train] + [dev] deps; ruff complexity gate
+  uv.lock                 # locked environment (uv sync)
+  mise.toml               # tool versions + tasks (setup/test/lint/smoke/train/eval)
+  .pre-commit-config.yaml # ruff + complexity gate + hygiene + full suite on push
+  .github/workflows/ci.yml# lint, format, complexity gate, full suite per PR
+  configs/                # hydra configs (data / model / train / eval / tracking)
   src/marineworld/
-    data/                 # alignment.py (AIS<->frame), fvessel.py, smd.py, splits.py
-    models/               # video ViT + VideoMAE head (v1)
-    train/                # pretrain + finetune entrypoints (v1)
-    eval/                 # linear probe, few-shot detection, tracking (v1)
+    data/                 # alignment.py (AIS<->frame), adapters, clips, manifest, video
+    models/               # videomae.py (video ViT + VideoMAE head)
+    train/                # pretrain, module, experiment, media, naming, callbacks
+    eval/                 # run_probes (orchestration), features, probes, encoders
     utils/                # seed.py (seed=42)
-  tests/                  # behavioural unit tests
+  tests/                  # behavioural tests, grouped into per-sub-feature classes
 ```
 
 ## Quick start
 
 The developer toolchain defaults to Python 3.13.7; package metadata retains Python
-3.11+ compatibility.
+3.11+ compatibility. Dependencies are locked in `uv.lock`.
 
 ```bash
-# Install tool versions + deps (uses mise + pip).
+# Install the locked environment (core + train + dev) via mise + uv.
 mise trust && mise run setup
 
-# Or without mise:
-pip install -e '.[train,dev]'
+# Or directly with uv.
+uv sync --all-extras
 
-# Run the fast, core-only unit tests (no torch needed).
-pytest -v tests/
+# Run the full test suite (needs the [train] extra).
+mise run test          # == uv run pytest -q
+
+# Fast core-only tests, no ML stack (what pre-commit runs before push).
+uv run pytest tests/test_alignment.py tests/test_splits.py tests/test_tooling.py
+
+# Lint, format check, and the ruff complexity gate — the same checks CI runs.
+mise run ci
 ```
 
 ## FVessel Clip-10
@@ -139,6 +152,12 @@ VideoMAE input contract plus deterministic train-only brightness jitter; validat
 and test transforms are deterministic and no spatial augmentation can silently
 misalign boxes. Single-dataset `data=smd` and `data=fvessel` runs remain supported.
 
+Frame counts come from decoding, not container metadata (which overreports several
+FVessel clips), and clips that fail to decode — including interior damage no frame
+count can describe — are dropped and counted with a warning rather than aborting the
+run. Decoding falls back from Decord to PyAV so a stream one backend dislikes still
+loads.
+
 Each training run writes a path-free `training_manifest.json` and logs it as a W&B
 dataset artifact. It records exact split membership, component checksums, licence
 and access metadata without uploading raw frames or restricted mount paths.
@@ -154,13 +173,23 @@ tracking:
   media_max_frames: 4
 ```
 
-The first validation batch at each configured epoch interval logs one video under
-`media/validation_inputs` and `media/validation_reconstruction`, with at most four
-evenly spaced frames. After training, the callback restores the checkpoint selected
-as best by Lightning and logs the same retained validation sample under
-`media/best_inputs` and `media/best_reconstruction`; it does not use the final
-in-memory weights. Logging is rank-zero-only and bounded to one video, up to
-`media_max_frames` frames, and one event per configured epoch interval.
+Media keys are stage-first and dataset-aware, so each stage owns its own W&B
+section and its scalars and previews group together:
+
+```text
+pretrain/<dataset>/media/{inputs,reconstruction}   # live weights, train batch
+val/<dataset>/media/{inputs,reconstruction}        # live weights, validation batch
+best/<dataset>/media/{inputs,reconstruction}       # restored best checkpoint
+```
+
+The dataset segment keeps a balanced joint SMD+FVessel run from overwriting one
+dataset's panel with the other's. The best-checkpoint previews restore the
+checkpoint Lightning selected as best and reuse the retained validation sample,
+not the final in-memory weights. Previews render under `module.eval()`, are
+rank-zero-only, and are bounded to one video of up to `media_max_frames` evenly
+spaced frames per configured epoch interval. Alongside the loss, each optimizer
+step logs `pretrain/lr` and `pretrain/grad_norm` so the warmup-cosine schedule is
+visible rather than inferred.
 
 > **Raw-frame upload warning:** online SMD and FVessel runs upload sampled raw video
 > frames and derived masked-reconstruction previews to W&B when media logging is
