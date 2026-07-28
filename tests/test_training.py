@@ -818,141 +818,777 @@ class _CheckpointPathTrainer:
         self.checkpoint.last_model_path = self.path
 
 
-def test_resolved_config_excludes_wandb_key_name_and_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WANDB_API_KEY", "secret-value")
-    cfg = _tracking_config()
-    cfg.tracking.api_key = "secret-value"
-    cfg.tracking.wandbApiKey = "camel-case-secret"
+class TestResolvedConfig:
+    """Config redaction, path allowlisting and reference-checkpoint content identity."""
 
-    serialized = json.dumps(resolved_config(cfg))
+    def test_resolved_config_excludes_wandb_key_name_and_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WANDB_API_KEY", "secret-value")
+        cfg = _tracking_config()
+        cfg.tracking.api_key = "secret-value"
+        cfg.tracking.wandbApiKey = "camel-case-secret"
 
-    assert "secret-value" not in serialized
-    assert "camel-case-secret" not in serialized
-    assert "WANDB_API_KEY" not in serialized
-    assert "api_key" not in serialized
-    assert "wandbApiKey" not in serialized
+        serialized = json.dumps(resolved_config(cfg))
 
+        assert "secret-value" not in serialized
+        assert "camel-case-secret" not in serialized
+        assert "WANDB_API_KEY" not in serialized
+        assert "api_key" not in serialized
+        assert "wandbApiKey" not in serialized
 
-def test_resolved_config_keeps_non_secret_tokenizer_settings() -> None:
-    cfg = OmegaConf.create({"model": {"tokenizer": "videomae"}})
+    def test_resolved_config_keeps_non_secret_tokenizer_settings(self) -> None:
+        cfg = OmegaConf.create({"model": {"tokenizer": "videomae"}})
 
-    assert resolved_config(cfg) == {"model": {"tokenizer": "videomae"}}
+        assert resolved_config(cfg) == {"model": {"tokenizer": "videomae"}}
 
+    def test_resolved_config_keeps_scientific_runtime_settings(self) -> None:
+        cfg = _compose_config("runtime=real_smoke")
 
-def test_resolved_config_keeps_scientific_runtime_settings() -> None:
-    cfg = _compose_config("runtime=real_smoke")
+        runtime = resolved_config(cfg)["runtime"]
 
-    runtime = resolved_config(cfg)["runtime"]
+        assert runtime == {
+            "precision": "32-true",
+            "batch_size": 1,
+            "accumulate_grad_batches": 1,
+            "max_steps": 2,
+            "limit_train_batches": 2,
+            "limit_val_batches": 1,
+        }
+        assert "accelerator" not in runtime
+        assert "devices" not in runtime
+        assert "num_workers" not in runtime
 
-    assert runtime == {
-        "precision": "32-true",
-        "batch_size": 1,
-        "accumulate_grad_batches": 1,
-        "max_steps": 2,
-        "limit_train_batches": 2,
-        "limit_val_batches": 1,
-    }
-    assert "accelerator" not in runtime
-    assert "devices" not in runtime
-    assert "num_workers" not in runtime
-
-
-@pytest.mark.parametrize(
-    ("machine_a", "machine_b", "make_checkpoint"),
-    [
-        ("machine-a/reference.ckpt", "machine-b/renamed.ckpt", _write_reference_file),
-        ("machine-a/saved-model", "machine-b/renamed-model", _write_reference_checkpoint),
-    ],
-)
-def test_reference_checkpoint_uses_portable_content_identity(
-    tmp_path: Path, machine_a: str, machine_b: str, make_checkpoint: Callable[[Path], None]
-) -> None:
-    first, second = tmp_path / machine_a, tmp_path / machine_b
-    make_checkpoint(first)
-    make_checkpoint(second)
-
-    first_resolved = resolved_config(
-        OmegaConf.create({"model": {"reference_checkpoint": str(first)}})
+    @pytest.mark.parametrize(
+        ("machine_a", "machine_b", "make_checkpoint"),
+        [
+            ("machine-a/reference.ckpt", "machine-b/renamed.ckpt", _write_reference_file),
+            ("machine-a/saved-model", "machine-b/renamed-model", _write_reference_checkpoint),
+        ],
     )
-    second_resolved = resolved_config(
-        OmegaConf.create({"model": {"reference_checkpoint": str(second)}})
+    def test_reference_checkpoint_uses_portable_content_identity(
+        self,
+        tmp_path: Path,
+        machine_a: str,
+        machine_b: str,
+        make_checkpoint: Callable[[Path], None],
+    ) -> None:
+        first, second = tmp_path / machine_a, tmp_path / machine_b
+        make_checkpoint(first)
+        make_checkpoint(second)
+
+        first_resolved = resolved_config(
+            OmegaConf.create({"model": {"reference_checkpoint": str(first)}})
+        )
+        second_resolved = resolved_config(
+            OmegaConf.create({"model": {"reference_checkpoint": str(second)}})
+        )
+        first_identity = build_run_identity(
+            "videomae", ("manifest",), 42, None, logical_dimensions={"config": first_resolved}
+        )
+        second_identity = build_run_identity(
+            "videomae", ("manifest",), 42, None, logical_dimensions={"config": second_resolved}
+        )
+
+        assert first_resolved == second_resolved
+        assert first_identity.condition_id == second_identity.condition_id
+        assert str(tmp_path) not in json.dumps(first_resolved)
+
+    def test_reference_checkpoint_content_changes_condition(self, tmp_path: Path) -> None:
+        checkpoint = tmp_path / "reference.ckpt"
+        cfg = OmegaConf.create({"model": {"reference_checkpoint": str(checkpoint)}})
+        checkpoint.write_bytes(b"first checkpoint")
+        first = resolved_config(cfg)
+
+        checkpoint.write_bytes(b"different checkpoint")
+        second = resolved_config(cfg)
+
+        assert first != second
+
+    @pytest.mark.parametrize(
+        ("filename", "replacement"),
+        [("config.json", b'{"model_type":"changed"}'), ("model.safetensors", b"new weights")],
     )
-    first_identity = build_run_identity(
-        "videomae", ("manifest",), 42, None, logical_dimensions={"config": first_resolved}
+    def test_reference_checkpoint_directory_content_changes_condition(
+        self, tmp_path: Path, filename: str, replacement: bytes
+    ) -> None:
+        checkpoint = tmp_path / "saved-model"
+        _write_reference_checkpoint(checkpoint)
+        cfg = OmegaConf.create({"model": {"reference_checkpoint": str(checkpoint)}})
+        first = resolved_config(cfg)
+
+        (checkpoint / filename).write_bytes(replacement)
+        second = resolved_config(cfg)
+
+        assert first != second
+
+    @pytest.mark.parametrize("data_config", ["fvessel", "synthetic", "joint_synthetic"])
+    def test_resolved_config_drops_component_roots_for_every_data_config(
+        self, data_config: str
+    ) -> None:
+        """The allowlist must survive joint configs, whose roots nest under data.components."""
+        configs = []
+        for sentinel in ("PRIVATE-PATH-A", "PRIVATE-PATH-B"):
+            cfg = _compose_config(
+                f"data={data_config}", "model=videomae_tiny", "runtime=local_smoke"
+            )
+            cfg.output_dir = f"/{sentinel}/outputs"
+            cfg.runtime.ckpt_path = f"/{sentinel}/checkpoint.ckpt"
+            cfg.data.root = f"/{sentinel}/data"
+            for component in cfg.data.get("components", {}).values():
+                component.root = f"/{sentinel}/{component.adapter._target_}"
+            OmegaConf.update(cfg, "tracking.api_key", f"{sentinel}-secret", force_add=True)
+            configs.append(cfg)
+
+        sanitized = resolved_config(configs[0])
+        serialized = json.dumps(sanitized)
+
+        assert resolved_config(configs[1]) == sanitized
+        assert "PRIVATE-PATH" not in serialized
+        assert "root" not in sanitized["data"]
+        assert all(
+            "root" not in component
+            for component in sanitized["data"].get("components", {}).values()
+        )
+        for dropped in ("output_dir", "tracking"):
+            assert dropped not in sanitized
+        assert "ckpt_path" not in sanitized["runtime"]
+        assert sanitized["model"]["name"] == "videomae_tiny"
+        assert sanitized["runtime"]["batch_size"] == 1
+
+
+class TestRunIdentity:
+    """Run and training identity determinism and metadata isolation."""
+
+    def test_run_identity_is_stable_across_manifest_order(self) -> None:
+        identity = build_run_identity("videomae", ("sha-a", "sha-b"), seed=42, label_fraction=None)
+
+        assert (
+            identity.condition_id
+            == build_run_identity(
+                "videomae", ("sha-b", "sha-a"), seed=42, label_fraction=None
+            ).condition_id
+        )
+        assert metric_name("probe", "macro_f1", "fvessel") == "probe/fvessel/macro_f1"
+
+    def test_run_identity_keeps_execution_metadata_out_of_run_id(self) -> None:
+        first = build_run_identity(
+            "videomae",
+            ("manifest",),
+            seed=42,
+            label_fraction=0.1,
+            git_sha="first",
+            accelerator="l4",
+        )
+        second = build_run_identity(
+            "videomae",
+            ("manifest",),
+            seed=42,
+            label_fraction=0.1,
+            git_sha="second",
+            accelerator="a100",
+        )
+
+        assert first.condition_id == second.condition_id
+        assert first.run_id != second.run_id
+        assert {"git:first", "accelerator:l4"} <= set(first.tags)
+
+    def test_run_identity_changes_with_scientific_configuration(self) -> None:
+        baseline = build_run_identity(
+            "videomae",
+            ("manifest",),
+            seed=42,
+            label_fraction=None,
+            logical_dimensions={"config": {"model": {"mask_ratio": 0.9}, "train": {"lr": 1e-4}}},
+        )
+        changed = build_run_identity(
+            "videomae",
+            ("manifest",),
+            seed=42,
+            label_fraction=None,
+            logical_dimensions={"config": {"model": {"mask_ratio": 0.75}, "train": {"lr": 1e-4}}},
+        )
+
+        assert baseline.condition_id != changed.condition_id
+        assert f"condition:{baseline.condition_id}" in baseline.tags
+
+    def test_run_identity_does_not_log_checkpoint_paths(self) -> None:
+        identity = build_run_identity(
+            "videomae",
+            ("manifest",),
+            seed=42,
+            label_fraction=None,
+            checkpoint_provenance="/private/checkpoints/last.ckpt",
+        )
+
+        assert "checkpoint:last.ckpt" in identity.tags
+        assert "/private" not in json.dumps(identity.tags)
+
+    def test_metric_name_omits_absent_dataset(self) -> None:
+        assert metric_name("pretrain", "loss") == "pretrain/loss"
+
+    @pytest.mark.parametrize(
+        ("update", "value"),
+        [
+            ("data.sampling_weights.smd", 0.9),
+            ("data.transforms.train.color_jitter", 0.2),
+            ("train.warmup_epochs", 20),
+        ],
     )
-    second_identity = build_run_identity(
-        "videomae", ("manifest",), 42, None, logical_dimensions={"config": second_resolved}
+    def test_training_identity_hashes_material_scientific_config(
+        self, tmp_path: Path, update: str, value: object
+    ) -> None:
+        cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
+        first = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
+        baseline = training_run_identity(cfg, first)
+        OmegaConf.update(cfg, update, value)
+
+        assert training_run_identity(cfg, first).condition_id != baseline.condition_id
+
+    def test_training_identity_ignores_execution_hardware(self, tmp_path: Path) -> None:
+        manifest = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
+        l4 = _compose_config("data=joint_synthetic", "model=videomae_tiny", "runtime=l4")
+        a100 = _compose_config("data=joint_synthetic", "model=videomae_tiny", "runtime=a100")
+        a100.runtime.batch_size = l4.runtime.batch_size
+        a100.runtime.accumulate_grad_batches = l4.runtime.accumulate_grad_batches
+
+        assert (
+            training_run_identity(l4, manifest).condition_id
+            == training_run_identity(a100, manifest).condition_id
+        )
+
+    def test_training_identity_is_stable_across_resume_horizon(self, tmp_path: Path) -> None:
+        manifest = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
+        first = _smoke_config(tmp_path, max_steps=2)
+        resumed = OmegaConf.merge(
+            first,
+            {
+                "runtime": {
+                    "max_steps": 3,
+                    "limit_train_batches": 1,
+                    "limit_val_batches": 1,
+                    "ckpt_path": str(tmp_path / "last.ckpt"),
+                }
+            },
+        )
+
+        assert (
+            training_run_identity(first, manifest).condition_id
+            == training_run_identity(resumed, manifest, "sha256:resume").condition_id
+        )
+
+
+class TestWandbLoggerBuild:
+    """W&B logger construction and resolved-config reuse."""
+
+    def test_disabled_tracking_does_not_construct_wandb_logger(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _unexpected_logger(**_: object) -> None:
+            raise AssertionError("disabled tracking must not construct a W&B logger")
+
+        monkeypatch.setattr("marineworld.train.experiment._create_wandb_logger", _unexpected_logger)
+
+        identity = RunIdentity("run", "group", ())
+        assert build_wandb_logger(_tracking_config("disabled"), identity) is False
+
+    @pytest.mark.parametrize(
+        ("mode", "expected_log_model"),
+        [("offline", False), ("online", "all")],
     )
+    def test_wandb_logger_configuration_is_offline_safe(
+        self, monkeypatch: pytest.MonkeyPatch, mode: str, expected_log_model: str | bool
+    ) -> None:
+        captured: dict[str, object] = {}
 
-    assert first_resolved == second_resolved
-    assert first_identity.condition_id == second_identity.condition_id
-    assert str(tmp_path) not in json.dumps(first_resolved)
+        def _fake_logger(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr("marineworld.train.experiment._create_wandb_logger", _fake_logger)
+        result = build_wandb_logger(
+            _tracking_config(mode), RunIdentity("stable-run", "videomae", ("accelerator:l4",))
+        )
+
+        assert result is not False
+        assert captured["offline"] is (mode == "offline")
+        assert captured["log_model"] == expected_log_model
+        assert captured["id"] == "stable-run"
+        assert captured["resume"] == "never"
+        assert "WANDB_API_KEY" not in json.dumps(captured["config"])
+
+    def test_shared_resolved_config_is_not_recomputed_by_the_logger(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """resolved_config touches the filesystem, so the run must resolve it once."""
+        calls: list[int] = []
+        real = experiment_module.resolved_config
+
+        def counting(cfg: DictConfig) -> dict[str, object]:
+            calls.append(1)
+            return real(cfg)
+
+        monkeypatch.setattr(experiment_module, "resolved_config", counting)
+        cfg = _compose_config("data=synthetic", "model=videomae_tiny", "runtime=local_smoke")
+        identity = build_run_identity("videomae", ("manifest",), 42, None)
+
+        build_wandb_logger(cfg, identity, real(cfg))
+
+        assert calls == []
 
 
-def test_reference_checkpoint_content_changes_condition(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "reference.ckpt"
-    cfg = OmegaConf.create({"model": {"reference_checkpoint": str(checkpoint)}})
-    checkpoint.write_bytes(b"first checkpoint")
-    first = resolved_config(cfg)
+class TestRuntimeProfiles:
+    """Hydra runtime profile composition and decoder selection."""
 
-    checkpoint.write_bytes(b"different checkpoint")
-    second = resolved_config(cfg)
-
-    assert first != second
-
-
-@pytest.mark.parametrize(
-    ("filename", "replacement"),
-    [("config.json", b'{"model_type":"changed"}'), ("model.safetensors", b"new weights")],
-)
-def test_reference_checkpoint_directory_content_changes_condition(
-    tmp_path: Path, filename: str, replacement: bytes
-) -> None:
-    checkpoint = tmp_path / "saved-model"
-    _write_reference_checkpoint(checkpoint)
-    cfg = OmegaConf.create({"model": {"reference_checkpoint": str(checkpoint)}})
-    first = resolved_config(cfg)
-
-    (checkpoint / filename).write_bytes(replacement)
-    second = resolved_config(cfg)
-
-    assert first != second
-
-
-@pytest.mark.parametrize("data_config", ["fvessel", "synthetic", "joint_synthetic"])
-def test_resolved_config_drops_component_roots_for_every_data_config(data_config: str) -> None:
-    """The allowlist must survive joint configs, whose roots nest under data.components."""
-    configs = []
-    for sentinel in ("PRIVATE-PATH-A", "PRIVATE-PATH-B"):
-        cfg = _compose_config(f"data={data_config}", "model=videomae_tiny", "runtime=local_smoke")
-        cfg.output_dir = f"/{sentinel}/outputs"
-        cfg.runtime.ckpt_path = f"/{sentinel}/checkpoint.ckpt"
-        cfg.data.root = f"/{sentinel}/data"
-        for component in cfg.data.get("components", {}).values():
-            component.root = f"/{sentinel}/{component.adapter._target_}"
-        OmegaConf.update(cfg, "tracking.api_key", f"{sentinel}-secret", force_add=True)
-        configs.append(cfg)
-
-    sanitized = resolved_config(configs[0])
-    serialized = json.dumps(sanitized)
-
-    assert resolved_config(configs[1]) == sanitized
-    assert "PRIVATE-PATH" not in serialized
-    assert "root" not in sanitized["data"]
-    assert all(
-        "root" not in component for component in sanitized["data"].get("components", {}).values()
+    @pytest.mark.parametrize(
+        ("runtime", "tracking_mode"),
+        [("local_smoke", "offline"), ("l4", "online"), ("a100", "online")],
     )
-    for dropped in ("output_dir", "tracking"):
-        assert dropped not in sanitized
-    assert "ckpt_path" not in sanitized["runtime"]
-    assert sanitized["model"]["name"] == "videomae_tiny"
-    assert sanitized["runtime"]["batch_size"] == 1
+    def test_runtime_profiles_compose_with_tracking(self, runtime: str, tracking_mode: str) -> None:
+        cfg = _compose_config(f"runtime={runtime}")
+
+        assert cfg.runtime.tracking_mode == tracking_mode
+        assert cfg.tracking.mode == tracking_mode
+
+    def test_single_gpu_profiles_only_tune_hardware_capacity(self) -> None:
+        l4 = _compose_config("runtime=l4")
+        a100 = _compose_config("runtime=a100")
+
+        l4_runtime = OmegaConf.to_container(l4.runtime, resolve=True)
+        a100_runtime = OmegaConf.to_container(a100.runtime, resolve=True)
+        assert isinstance(l4_runtime, dict)
+        assert isinstance(a100_runtime, dict)
+        assert l4_runtime.keys() == a100_runtime.keys()
+        changed = {
+            key
+            for key in l4_runtime.keys() | a100_runtime.keys()
+            if l4_runtime.get(key) != a100_runtime.get(key)
+        }
+
+        assert changed == {"precision", "batch_size", "accumulate_grad_batches", "num_workers"}
+
+    def test_local_smoke_profile_uses_cpu(self) -> None:
+        cfg = _compose_config("runtime=local_smoke")
+
+        assert cfg.runtime.accelerator == "cpu"
+
+    def test_real_smoke_profile_is_bounded_and_online(self) -> None:
+        cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=real_smoke")
+
+        assert cfg.runtime.max_steps == 2
+        assert cfg.runtime.limit_train_batches == 2
+        assert cfg.runtime.limit_val_batches == 1
+        assert cfg.runtime.num_workers == 0
+        assert cfg.runtime.tracking_mode == "online"
+
+    def test_real_data_uses_portable_video_decoder(self) -> None:
+        cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
+
+        assert isinstance(build_decoder(cfg), AutoVideoDecoder)
 
 
-def test_importing_experiment_does_not_mutate_environment() -> None:
-    source_dir = Path(__file__).resolve().parents[1] / "src"
-    environment = os.environ | {"PYTHONPATH": str(source_dir)}
-    program = """
+class TestBalancedSampler:
+    """Balanced sampling, resume, distributed sharding and draw tokens."""
+
+    @pytest.mark.parametrize(
+        ("weights", "message"),
+        [
+            ({"smd": 0.5, "fvessel": 0.5}, r"absent from the corpus: smd\. Present: fvessel"),
+            ({"fvessel": 1.0, "nir": 1.0}, r"absent from the corpus: nir"),
+            ({"fvessel": 0.0}, r"must be positive: fvessel"),
+        ],
+    )
+    def test_balanced_sampler_names_the_offending_dataset(
+        self, weights: dict[str, float], message: str
+    ) -> None:
+        """A joint config pointed at a missing corpus must say which one is missing."""
+        with pytest.raises(ValueError, match=message):
+            BalancedDatasetSampler(("fvessel", "fvessel"), weights=weights, seed=7)
+
+    def test_clip_index_reuses_a_supplied_fingerprint(self, tmp_path: Path) -> None:
+        """Both split datasets share one corpus hash instead of each rehashing it."""
+        manifest = SyntheticAdapter(num_frames=4, num_videos=12).build_manifest(tmp_path / "data")
+        index = functools.partial(
+            build_clip_index, manifest, split="train", frames=2, stride=1, seed=42
+        )
+
+        assert index(fingerprint=manifest_checksum(manifest)) == index()
+        # ordering is fingerprint-derived, so a supplied value must actually be used
+        assert index(fingerprint="a-different-corpus") != index()
+
+    def test_balanced_sampler_equalizes_datasets_and_replays_from_epoch(self) -> None:
+        dataset_ids = ("smd",) * 90 + ("fvessel",) * 10
+        first = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
+        first.set_epoch(3)
+        indices = list(first)
+        first.position = 10
+        state = first.state_dict()
+        resumed = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
+        resumed.load_state_dict(state)
+
+        assert [dataset_ids[index] for index in indices].count("smd") == 50
+        assert [dataset_ids[index] for index in indices].count("fvessel") == 50
+        assert list(resumed) == indices[10:]
+
+    def test_dataloader_uses_distributed_rank_from_lightning_environment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cfg = _smoke_config(tmp_path, max_steps=2)
+        adapter = SyntheticAdapter(num_frames=4, num_videos=2)
+        manifest = adapter.build_manifest(tmp_path / "data")
+        monkeypatch.setenv("RANK", "1")
+        monkeypatch.setenv("WORLD_SIZE", "2")
+
+        sampler = build_dataloaders(cfg, manifest)["train_dataloaders"].sampler
+
+        assert isinstance(sampler, BalancedDatasetSampler)
+        assert (sampler.rank, sampler.replicas) == (1, 2)
+
+    def test_balanced_sampler_partitions_one_global_order_across_ranks(self) -> None:
+        dataset_ids = ("smd",) * 8 + ("fvessel",) * 4
+        global_order = list(BalancedDatasetSampler(dataset_ids, seed=42))
+        rank_zero = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=0, replicas=2))
+        rank_one = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=1, replicas=2))
+
+        assert rank_zero == global_order[0::2]
+        assert rank_one == global_order[1::2]
+
+    def test_balanced_sampler_pads_odd_global_order_equally_across_ranks(self) -> None:
+        dataset_ids = ("smd",) * 7 + ("fvessel",) * 4
+        rank_zero = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=0, replicas=2))
+        rank_one = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=1, replicas=2))
+
+        assert len(rank_zero) == len(rank_one) == 6
+        combined = rank_zero + rank_one
+        assert [dataset_ids[index] for index in combined].count("smd") == 6
+        assert [dataset_ids[index] for index in combined].count("fvessel") == 6
+
+    def test_sampler_callback_advances_relative_to_restored_position(self) -> None:
+        sampler = BalancedDatasetSampler(("smd",) * 4 + ("fvessel",) * 4, seed=42)
+        callback = BalancedSamplerCheckpoint(sampler, batch_size=2)
+        callback.load_state_dict({"epoch": 0, "position": 4})
+
+        callback.on_train_batch_end(None, None, None, None, batch_idx=0)  # type: ignore[arg-type]
+        assert sampler.position == 6
+        callback.on_train_batch_end(None, None, None, None, batch_idx=1)  # type: ignore[arg-type]
+
+        assert sampler.position == 8
+
+    def test_draw_tokens_vary_by_epoch_and_replay_after_resume(self, tmp_path: Path) -> None:
+        cfg = _smoke_config(tmp_path, max_steps=2)
+        adapter = SyntheticAdapter(num_frames=4, num_videos=4)
+        manifest = adapter.build_manifest(tmp_path / "data")
+        loader = build_dataloaders(cfg, manifest)["train_dataloaders"]
+        sampler = loader.sampler
+        assert isinstance(sampler, BalancedDatasetSampler)
+        dataset = loader.dataset
+
+        first_draw = list(sampler)[0]
+        sampler.set_epoch(1)
+        second_draw = list(sampler)[0]
+        assert not torch.equal(
+            dataset[first_draw]["pixel_values"], dataset[second_draw]["pixel_values"]
+        )
+
+        sampler.set_epoch(3)
+        sampler.position = 1
+        state = sampler.state_dict()
+        remaining = list(sampler)
+        replay = BalancedDatasetSampler(
+            tuple("synthetic" for _ in range(len(dataset))),
+            seed=int(cfg.seed),
+            draw_tokens=True,
+        )
+        replay.load_state_dict(state)
+        replayed = list(replay)
+        assert replayed == remaining
+        assert all(
+            torch.equal(dataset[left]["pixel_values"], dataset[right]["pixel_values"])
+            for left, right in zip(remaining, replayed, strict=True)
+        )
+
+        val_dataset = build_dataloaders(cfg, manifest)["val_dataloaders"].dataset
+        assert torch.equal(val_dataset[0]["pixel_values"], val_dataset[0]["pixel_values"])
+
+
+class TestTrainingManifest:
+    """Manifest splitting, path redaction and batch collation."""
+
+    def test_annotated_fvessel_batches_omit_non_collatable_targets(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        adapter, manifest = _fvessel_manifest(tmp_path / "fvessel", videos=2)
+        manifest = replace(
+            manifest,
+            records=(manifest.records[0], replace(manifest.records[1], split="val")),
+        )
+        cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
+        monkeypatch.setattr(
+            "marineworld.train.pretrain.build_decoder",
+            lambda _: SyntheticVideoDecoder(height=16, width=16),
+        )
+        monkeypatch.setattr(
+            FVesselAdapter,
+            "load_targets",
+            lambda *_: pytest.fail("SSL must not parse supervised annotations"),
+        )
+
+        dataloaders = build_dataloaders(cfg, manifest)
+        batch = next(iter(dataloaders["train_dataloaders"]))
+
+        assert batch.keys() == {"pixel_values", "dataset", "record_id", "source"}
+        assert batch["pixel_values"].shape == (1, 4, 3, 16, 16)
+
+    def test_default_fvessel_manifest_is_split_by_video_without_overlap(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, manifest = _fvessel_manifest(tmp_path / "fvessel")
+        cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
+
+        first = prepare_training_manifest(cfg, manifest)
+        second = prepare_training_manifest(cfg, adapter.build_manifest(tmp_path / "fvessel"))
+
+        first_splits = {
+            split: {record.video_path for record in first.records if record.split == split}
+            for split in ("train", "val", "test")
+        }
+        second_splits = {
+            split: {record.video_path for record in second.records if record.split == split}
+            for split in ("train", "val", "test")
+        }
+        assert first_splits == second_splits
+        assert first_splits["train"]
+        assert first_splits["val"]
+        assert not first_splits["train"] & first_splits["val"]
+        assert not first_splits["train"] & first_splits["test"]
+        assert not first_splits["val"] & first_splits["test"]
+
+    @pytest.mark.parametrize("videos", [2, 3])
+    def test_small_fvessel_manifest_still_has_train_and_validation(
+        self, tmp_path: Path, videos: int
+    ) -> None:
+        _, manifest = _fvessel_manifest(tmp_path / "fvessel", videos=videos)
+        cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
+
+        prepared = prepare_training_manifest(cfg, manifest)
+
+        assert {record.split for record in prepared.records} >= {"train", "val"}
+
+    def test_single_video_cannot_form_train_and_validation_splits(self, tmp_path: Path) -> None:
+        _, manifest = _fvessel_manifest(tmp_path / "fvessel", videos=1)
+        cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
+
+        with pytest.raises(ValueError, match="at least two videos"):
+            prepare_training_manifest(cfg, manifest)
+
+    def test_training_manifest_records_exact_splits_without_raw_paths(self, tmp_path: Path) -> None:
+        _, manifest = _fvessel_manifest(tmp_path / "restricted", videos=2)
+
+        path = write_training_manifest(manifest, tmp_path / "artifacts")
+        payload = json.loads(path.read_text())
+
+        assert payload["manifest_checksum"] == manifest_checksum(manifest)
+        assert {record["id"] for record in payload["records"]} == {
+            record.id for record in manifest.records
+        }
+        assert "video_path" not in path.read_text()
+        assert str(tmp_path / "restricted") not in path.read_text()
+
+    def test_joint_split_preserves_each_component_in_training(self, tmp_path: Path) -> None:
+        composite = CompositeAdapter(
+            components={
+                "smd": SyntheticAdapter(num_frames=4, num_videos=2),
+                "fvessel": SyntheticAdapter(num_frames=4, num_videos=2),
+            },
+            roots={"smd": tmp_path / "smd", "fvessel": tmp_path / "fvessel"},
+        )
+        manifest = composite.build_manifest(tmp_path)
+        manifest = replace(
+            manifest,
+            records=tuple(replace(record, split="train") for record in manifest.records),
+        )
+        cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
+        cfg.seed = 5
+
+        prepared = prepare_training_manifest(cfg, manifest)
+
+        assert {record.dataset for record in prepared.records if record.split == "train"} == {
+            "smd",
+            "fvessel",
+        }
+
+
+class TestPretrainingRun:
+    """run_pretraining lifecycle, checkpointing and W&B teardown."""
+
+    def test_empty_data_root_fails_before_trainer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
+        cfg.data.root = str(tmp_path / "empty")
+        cfg.data.adapter.fps = 30.0
+        cfg.output_dir = str(tmp_path / "output")
+        cfg.tracking.mode = "disabled"
+        monkeypatch.setattr(
+            "marineworld.train.pretrain.build_trainer",
+            lambda *_args, **_kwargs: pytest.fail("Trainer must not be built for empty data"),
+        )
+
+        with pytest.raises(ValueError, match="manifest contains no records"):
+            run_pretraining(cfg)
+
+    def test_too_short_records_fail_before_trainer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cfg = _smoke_config(tmp_path, max_steps=2)
+        cfg.data.adapter.num_frames = 2
+        monkeypatch.setattr(
+            "marineworld.train.pretrain.build_trainer",
+            lambda *_args, **_kwargs: pytest.fail("Trainer must not be built for empty loaders"),
+        )
+
+        with pytest.raises(ValueError, match="training split produced no clips"):
+            run_pretraining(cfg)
+
+    @pytest.mark.parametrize(
+        ("last_path", "message"),
+        [
+            ("", "without a last checkpoint path"),
+            ("missing.ckpt", "last checkpoint does not exist"),
+        ],
+    )
+    def test_run_pretraining_rejects_invalid_last_checkpoint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        last_path: str,
+        message: str,
+    ) -> None:
+        def _trainer_factory(
+            _cfg: DictConfig, *, logger: object, callbacks: list[object]
+        ) -> _CheckpointPathTrainer:
+            del logger
+            return _CheckpointPathTrainer(callbacks[0], last_path)
+
+        monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: False)
+        monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
+        monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
+
+        with pytest.raises(RuntimeError, match=message):
+            run_pretraining(_smoke_config(tmp_path, max_steps=2))
+
+    def test_run_pretraining_finishes_wandb_before_starting_another_run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        active = False
+        exit_codes: list[int] = []
+        failures = iter((False, True))
+
+        def _finish(*, exit_code: int) -> None:
+            nonlocal active
+            active = False
+            exit_codes.append(exit_code)
+
+        def _logger_factory(*_: object) -> object:
+            nonlocal active
+            assert not active, "the prior W&B run leaked into the next training call"
+            active = True
+            return SimpleNamespace(experiment=SimpleNamespace(finish=_finish))
+
+        def _trainer_factory(
+            _cfg: DictConfig, *, logger: object, callbacks: list[object]
+        ) -> _FakeTrainer:
+            del logger
+            return _FakeTrainer(callbacks[0], fail=next(failures))
+
+        monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", _logger_factory)
+        monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
+        monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
+
+        assert run_pretraining(_smoke_config(tmp_path / "success", max_steps=2)).is_file()
+        assert not active
+
+        with pytest.raises(RuntimeError, match="forced trainer failure"):
+            run_pretraining(_smoke_config(tmp_path / "failure", max_steps=2))
+
+        assert not active
+        assert exit_codes == [0, 1]
+
+    def test_wandb_cleanup_does_not_mask_training_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        logger = SimpleNamespace(
+            experiment=SimpleNamespace(
+                finish=lambda **_: (_ for _ in ()).throw(RuntimeError("cleanup failure"))
+            )
+        )
+
+        def _trainer_factory(
+            _cfg: DictConfig, *, logger: object, callbacks: list[object]
+        ) -> _FakeTrainer:
+            del logger
+            return _FakeTrainer(callbacks[0], fail=True)
+
+        monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: logger)
+        monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
+        monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
+
+        with pytest.raises(RuntimeError, match="forced trainer failure"):
+            run_pretraining(_smoke_config(tmp_path, max_steps=2))
+
+    def test_local_smoke_saves_best_and_last_then_resumes(self, tmp_path: Path) -> None:
+        cfg = _smoke_config(tmp_path, max_steps=2)
+
+        first_checkpoint = run_pretraining(cfg)
+
+        assert first_checkpoint == tmp_path / "output" / "checkpoints" / "last.ckpt"
+        assert first_checkpoint.exists()
+        assert any(path.name != "last.ckpt" for path in first_checkpoint.parent.glob("*.ckpt"))
+        first_state = torch.load(first_checkpoint, map_location="cpu", weights_only=False)
+        assert first_state["global_step"] == 2
+
+        resumed = OmegaConf.merge(
+            cfg,
+            {"runtime": {"max_steps": 3, "ckpt_path": str(first_checkpoint)}},
+        )
+        second_checkpoint = run_pretraining(resumed)
+
+        state = torch.load(second_checkpoint, map_location="cpu", weights_only=False)
+        assert state["global_step"] == 3
+
+    def test_local_smoke_saves_last_checkpoint_on_exception(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        original_training_step = VideoMAEPretrainingModule.training_step
+
+        def _fail_after_first_step(
+            module: VideoMAEPretrainingModule,
+            batch: dict[str, object],
+            batch_idx: int,
+        ) -> torch.Tensor:
+            if module.global_step == 1:
+                raise RuntimeError("forced training failure")
+            return original_training_step(module, batch, batch_idx)
+
+        monkeypatch.setattr(VideoMAEPretrainingModule, "training_step", _fail_after_first_step)
+        cfg = _smoke_config(tmp_path, max_steps=2)
+
+        with pytest.raises(RuntimeError, match="forced training failure"):
+            run_pretraining(cfg)
+
+        checkpoint = tmp_path / "output" / "checkpoints" / "last.ckpt"
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        assert state["global_step"] == 1
+
+
+class TestCli:
+    """Subprocess entrypoints and import-time hygiene."""
+
+    def test_importing_experiment_does_not_mutate_environment(self) -> None:
+        source_dir = Path(__file__).resolve().parents[1] / "src"
+        environment = os.environ | {"PYTHONPATH": str(source_dir)}
+        program = """
 import json
 import os
 import sys
@@ -962,885 +1598,269 @@ import marineworld.train.experiment
 state = [before, dict(os.environ), "pytorch_lightning" in sys.modules]
 print(json.dumps(state, sort_keys=True))
 """
-    result = subprocess.run(
-        [sys.executable, "-c", program],
-        check=True,
-        capture_output=True,
-        env=environment,
-        text=True,
-    )
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            check=True,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
 
-    before, after, lightning_imported = json.loads(result.stdout)
-    assert after == before
-    assert lightning_imported is False
+        before, after, lightning_imported = json.loads(result.stdout)
+        assert after == before
+        assert lightning_imported is False
 
-
-def test_importing_models_does_not_load_optional_training_dependencies() -> None:
-    source_dir = Path(__file__).resolve().parents[1] / "src"
-    environment = os.environ | {"PYTHONPATH": str(source_dir)}
-    program = """
+    def test_importing_models_does_not_load_optional_training_dependencies(self) -> None:
+        source_dir = Path(__file__).resolve().parents[1] / "src"
+        environment = os.environ | {"PYTHONPATH": str(source_dir)}
+        program = """
 import json
 import sys
 
 import marineworld.models
 print(json.dumps({"torch": "torch" in sys.modules, "transformers": "transformers" in sys.modules}))
 """
-    result = subprocess.run(
-        [sys.executable, "-c", program],
-        check=True,
-        capture_output=True,
-        env=environment,
-        text=True,
-    )
-
-    assert json.loads(result.stdout) == {"torch": False, "transformers": False}
-
-
-def test_run_identity_is_stable_across_manifest_order() -> None:
-    identity = build_run_identity("videomae", ("sha-a", "sha-b"), seed=42, label_fraction=None)
-
-    assert (
-        identity.condition_id
-        == build_run_identity(
-            "videomae", ("sha-b", "sha-a"), seed=42, label_fraction=None
-        ).condition_id
-    )
-    assert metric_name("probe", "macro_f1", "fvessel") == "probe/fvessel/macro_f1"
-
-
-def test_run_identity_keeps_execution_metadata_out_of_run_id() -> None:
-    first = build_run_identity(
-        "videomae", ("manifest",), seed=42, label_fraction=0.1, git_sha="first", accelerator="l4"
-    )
-    second = build_run_identity(
-        "videomae", ("manifest",), seed=42, label_fraction=0.1, git_sha="second", accelerator="a100"
-    )
-
-    assert first.condition_id == second.condition_id
-    assert first.run_id != second.run_id
-    assert {"git:first", "accelerator:l4"} <= set(first.tags)
-
-
-def test_run_identity_changes_with_scientific_configuration() -> None:
-    baseline = build_run_identity(
-        "videomae",
-        ("manifest",),
-        seed=42,
-        label_fraction=None,
-        logical_dimensions={"config": {"model": {"mask_ratio": 0.9}, "train": {"lr": 1e-4}}},
-    )
-    changed = build_run_identity(
-        "videomae",
-        ("manifest",),
-        seed=42,
-        label_fraction=None,
-        logical_dimensions={"config": {"model": {"mask_ratio": 0.75}, "train": {"lr": 1e-4}}},
-    )
-
-    assert baseline.condition_id != changed.condition_id
-    assert f"condition:{baseline.condition_id}" in baseline.tags
-
-
-def test_run_identity_does_not_log_checkpoint_paths() -> None:
-    identity = build_run_identity(
-        "videomae",
-        ("manifest",),
-        seed=42,
-        label_fraction=None,
-        checkpoint_provenance="/private/checkpoints/last.ckpt",
-    )
-
-    assert "checkpoint:last.ckpt" in identity.tags
-    assert "/private" not in json.dumps(identity.tags)
-
-
-def test_metric_name_omits_absent_dataset() -> None:
-    assert metric_name("pretrain", "loss") == "pretrain/loss"
-
-
-def test_disabled_tracking_does_not_construct_wandb_logger(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _unexpected_logger(**_: object) -> None:
-        raise AssertionError("disabled tracking must not construct a W&B logger")
-
-    monkeypatch.setattr("marineworld.train.experiment._create_wandb_logger", _unexpected_logger)
-
-    identity = RunIdentity("run", "group", ())
-    assert build_wandb_logger(_tracking_config("disabled"), identity) is False
-
-
-@pytest.mark.parametrize(
-    ("mode", "expected_log_model"),
-    [("offline", False), ("online", "all")],
-)
-def test_wandb_logger_configuration_is_offline_safe(
-    monkeypatch: pytest.MonkeyPatch, mode: str, expected_log_model: str | bool
-) -> None:
-    captured: dict[str, object] = {}
-
-    def _fake_logger(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr("marineworld.train.experiment._create_wandb_logger", _fake_logger)
-    result = build_wandb_logger(
-        _tracking_config(mode), RunIdentity("stable-run", "videomae", ("accelerator:l4",))
-    )
-
-    assert result is not False
-    assert captured["offline"] is (mode == "offline")
-    assert captured["log_model"] == expected_log_model
-    assert captured["id"] == "stable-run"
-    assert captured["resume"] == "never"
-    assert "WANDB_API_KEY" not in json.dumps(captured["config"])
-
-
-@pytest.mark.parametrize(
-    ("runtime", "tracking_mode"),
-    [("local_smoke", "offline"), ("l4", "online"), ("a100", "online")],
-)
-def test_runtime_profiles_compose_with_tracking(runtime: str, tracking_mode: str) -> None:
-    cfg = _compose_config(f"runtime={runtime}")
-
-    assert cfg.runtime.tracking_mode == tracking_mode
-    assert cfg.tracking.mode == tracking_mode
-
-
-def test_single_gpu_profiles_only_tune_hardware_capacity() -> None:
-    l4 = _compose_config("runtime=l4")
-    a100 = _compose_config("runtime=a100")
-
-    l4_runtime = OmegaConf.to_container(l4.runtime, resolve=True)
-    a100_runtime = OmegaConf.to_container(a100.runtime, resolve=True)
-    assert isinstance(l4_runtime, dict)
-    assert isinstance(a100_runtime, dict)
-    assert l4_runtime.keys() == a100_runtime.keys()
-    changed = {
-        key
-        for key in l4_runtime.keys() | a100_runtime.keys()
-        if l4_runtime.get(key) != a100_runtime.get(key)
-    }
-
-    assert changed == {"precision", "batch_size", "accumulate_grad_batches", "num_workers"}
-
-
-def test_local_smoke_profile_uses_cpu() -> None:
-    cfg = _compose_config("runtime=local_smoke")
-
-    assert cfg.runtime.accelerator == "cpu"
-
-
-def test_real_smoke_profile_is_bounded_and_online() -> None:
-    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=real_smoke")
-
-    assert cfg.runtime.max_steps == 2
-    assert cfg.runtime.limit_train_batches == 2
-    assert cfg.runtime.limit_val_batches == 1
-    assert cfg.runtime.num_workers == 0
-    assert cfg.runtime.tracking_mode == "online"
-
-
-def test_real_data_uses_portable_video_decoder() -> None:
-    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
-
-    assert isinstance(build_decoder(cfg), AutoVideoDecoder)
-
-
-def test_annotated_fvessel_batches_omit_non_collatable_targets(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    adapter, manifest = _fvessel_manifest(tmp_path / "fvessel", videos=2)
-    manifest = replace(
-        manifest,
-        records=(manifest.records[0], replace(manifest.records[1], split="val")),
-    )
-    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
-    monkeypatch.setattr(
-        "marineworld.train.pretrain.build_decoder",
-        lambda _: SyntheticVideoDecoder(height=16, width=16),
-    )
-    monkeypatch.setattr(
-        FVesselAdapter,
-        "load_targets",
-        lambda *_: pytest.fail("SSL must not parse supervised annotations"),
-    )
-
-    dataloaders = build_dataloaders(cfg, manifest)
-    batch = next(iter(dataloaders["train_dataloaders"]))
-
-    assert batch.keys() == {"pixel_values", "dataset", "record_id", "source"}
-    assert batch["pixel_values"].shape == (1, 4, 3, 16, 16)
-
-
-@pytest.mark.parametrize(
-    ("weights", "message"),
-    [
-        ({"smd": 0.5, "fvessel": 0.5}, r"absent from the corpus: smd\. Present: fvessel"),
-        ({"fvessel": 1.0, "nir": 1.0}, r"absent from the corpus: nir"),
-        ({"fvessel": 0.0}, r"must be positive: fvessel"),
-    ],
-)
-def test_balanced_sampler_names_the_offending_dataset(
-    weights: dict[str, float], message: str
-) -> None:
-    """A joint config pointed at a missing corpus must say which one is missing."""
-    with pytest.raises(ValueError, match=message):
-        BalancedDatasetSampler(("fvessel", "fvessel"), weights=weights, seed=7)
-
-
-def test_shared_resolved_config_is_not_recomputed_by_the_logger(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """resolved_config touches the filesystem, so the run must resolve it once."""
-    calls: list[int] = []
-    real = experiment_module.resolved_config
-
-    def counting(cfg: DictConfig) -> dict[str, object]:
-        calls.append(1)
-        return real(cfg)
-
-    monkeypatch.setattr(experiment_module, "resolved_config", counting)
-    cfg = _compose_config("data=synthetic", "model=videomae_tiny", "runtime=local_smoke")
-    identity = build_run_identity("videomae", ("manifest",), 42, None)
-
-    build_wandb_logger(cfg, identity, real(cfg))
-
-    assert calls == []
-
-
-def test_clip_index_reuses_a_supplied_fingerprint(tmp_path: Path) -> None:
-    """Both split datasets share one corpus hash instead of each rehashing it."""
-    manifest = SyntheticAdapter(num_frames=4, num_videos=12).build_manifest(tmp_path / "data")
-    index = functools.partial(
-        build_clip_index, manifest, split="train", frames=2, stride=1, seed=42
-    )
-
-    assert index(fingerprint=manifest_checksum(manifest)) == index()
-    # ordering is fingerprint-derived, so a supplied value must actually be used
-    assert index(fingerprint="a-different-corpus") != index()
-
-
-def test_balanced_sampler_equalizes_datasets_and_replays_from_epoch() -> None:
-    dataset_ids = ("smd",) * 90 + ("fvessel",) * 10
-    first = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
-    first.set_epoch(3)
-    indices = list(first)
-    first.position = 10
-    state = first.state_dict()
-    resumed = BalancedDatasetSampler(dataset_ids, weights={"smd": 0.5, "fvessel": 0.5}, seed=7)
-    resumed.load_state_dict(state)
-
-    assert [dataset_ids[index] for index in indices].count("smd") == 50
-    assert [dataset_ids[index] for index in indices].count("fvessel") == 50
-    assert list(resumed) == indices[10:]
-
-
-def test_dataloader_uses_distributed_rank_from_lightning_environment(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    cfg = _smoke_config(tmp_path, max_steps=2)
-    adapter = SyntheticAdapter(num_frames=4, num_videos=2)
-    manifest = adapter.build_manifest(tmp_path / "data")
-    monkeypatch.setenv("RANK", "1")
-    monkeypatch.setenv("WORLD_SIZE", "2")
-
-    sampler = build_dataloaders(cfg, manifest)["train_dataloaders"].sampler
-
-    assert isinstance(sampler, BalancedDatasetSampler)
-    assert (sampler.rank, sampler.replicas) == (1, 2)
-
-
-def test_balanced_sampler_partitions_one_global_order_across_ranks() -> None:
-    dataset_ids = ("smd",) * 8 + ("fvessel",) * 4
-    global_order = list(BalancedDatasetSampler(dataset_ids, seed=42))
-    rank_zero = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=0, replicas=2))
-    rank_one = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=1, replicas=2))
-
-    assert rank_zero == global_order[0::2]
-    assert rank_one == global_order[1::2]
-
-
-def test_balanced_sampler_pads_odd_global_order_equally_across_ranks() -> None:
-    dataset_ids = ("smd",) * 7 + ("fvessel",) * 4
-    rank_zero = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=0, replicas=2))
-    rank_one = list(BalancedDatasetSampler(dataset_ids, seed=42, rank=1, replicas=2))
-
-    assert len(rank_zero) == len(rank_one) == 6
-    combined = rank_zero + rank_one
-    assert [dataset_ids[index] for index in combined].count("smd") == 6
-    assert [dataset_ids[index] for index in combined].count("fvessel") == 6
-
-
-def test_default_fvessel_manifest_is_split_by_video_without_overlap(tmp_path: Path) -> None:
-    adapter, manifest = _fvessel_manifest(tmp_path / "fvessel")
-    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
-
-    first = prepare_training_manifest(cfg, manifest)
-    second = prepare_training_manifest(cfg, adapter.build_manifest(tmp_path / "fvessel"))
-
-    first_splits = {
-        split: {record.video_path for record in first.records if record.split == split}
-        for split in ("train", "val", "test")
-    }
-    second_splits = {
-        split: {record.video_path for record in second.records if record.split == split}
-        for split in ("train", "val", "test")
-    }
-    assert first_splits == second_splits
-    assert first_splits["train"]
-    assert first_splits["val"]
-    assert not first_splits["train"] & first_splits["val"]
-    assert not first_splits["train"] & first_splits["test"]
-    assert not first_splits["val"] & first_splits["test"]
-
-
-@pytest.mark.parametrize("videos", [2, 3])
-def test_small_fvessel_manifest_still_has_train_and_validation(tmp_path: Path, videos: int) -> None:
-    _, manifest = _fvessel_manifest(tmp_path / "fvessel", videos=videos)
-    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
-
-    prepared = prepare_training_manifest(cfg, manifest)
-
-    assert {record.split for record in prepared.records} >= {"train", "val"}
-
-
-def test_single_video_cannot_form_train_and_validation_splits(tmp_path: Path) -> None:
-    _, manifest = _fvessel_manifest(tmp_path / "fvessel", videos=1)
-    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
-
-    with pytest.raises(ValueError, match="at least two videos"):
-        prepare_training_manifest(cfg, manifest)
-
-
-def test_empty_data_root_fails_before_trainer(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
-    cfg.data.root = str(tmp_path / "empty")
-    cfg.data.adapter.fps = 30.0
-    cfg.output_dir = str(tmp_path / "output")
-    cfg.tracking.mode = "disabled"
-    monkeypatch.setattr(
-        "marineworld.train.pretrain.build_trainer",
-        lambda *_args, **_kwargs: pytest.fail("Trainer must not be built for empty data"),
-    )
-
-    with pytest.raises(ValueError, match="manifest contains no records"):
-        run_pretraining(cfg)
-
-
-def test_empty_data_root_cli_exits_without_checkpoint(tmp_path: Path) -> None:
-    root = tmp_path / "empty"
-    output_dir = tmp_path / "output"
-    root.mkdir()
-    environment = os.environ | {"KMP_USE_SHM": "0", "TMPDIR": "/tmp"}
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "marineworld.train.pretrain",
-            "data=fvessel",
-            "model=videomae_tiny",
-            "runtime=local_smoke",
-            "data.adapter.fps=30",
-            f"data.root={root}",
-            f"output_dir={output_dir}",
-        ],
-        capture_output=True,
-        cwd=tmp_path,
-        env=environment,
-        text=True,
-        timeout=180,
-    )
-
-    assert result.returncode != 0
-    assert "manifest contains no records" in result.stderr
-    assert not (output_dir / "checkpoints").exists()
-
-
-def test_too_short_records_fail_before_trainer(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    cfg = _smoke_config(tmp_path, max_steps=2)
-    cfg.data.adapter.num_frames = 2
-    monkeypatch.setattr(
-        "marineworld.train.pretrain.build_trainer",
-        lambda *_args, **_kwargs: pytest.fail("Trainer must not be built for empty loaders"),
-    )
-
-    with pytest.raises(ValueError, match="training split produced no clips"):
-        run_pretraining(cfg)
-
-
-@pytest.mark.parametrize(
-    ("last_path", "message"),
-    [("", "without a last checkpoint path"), ("missing.ckpt", "last checkpoint does not exist")],
-)
-def test_run_pretraining_rejects_invalid_last_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    last_path: str,
-    message: str,
-) -> None:
-    def _trainer_factory(
-        _cfg: DictConfig, *, logger: object, callbacks: list[object]
-    ) -> _CheckpointPathTrainer:
-        del logger
-        return _CheckpointPathTrainer(callbacks[0], last_path)
-
-    monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: False)
-    monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
-    monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
-
-    with pytest.raises(RuntimeError, match=message):
-        run_pretraining(_smoke_config(tmp_path, max_steps=2))
-
-
-def test_run_pretraining_finishes_wandb_before_starting_another_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    active = False
-    exit_codes: list[int] = []
-    failures = iter((False, True))
-
-    def _finish(*, exit_code: int) -> None:
-        nonlocal active
-        active = False
-        exit_codes.append(exit_code)
-
-    def _logger_factory(*_: object) -> object:
-        nonlocal active
-        assert not active, "the prior W&B run leaked into the next training call"
-        active = True
-        return SimpleNamespace(experiment=SimpleNamespace(finish=_finish))
-
-    def _trainer_factory(
-        _cfg: DictConfig, *, logger: object, callbacks: list[object]
-    ) -> _FakeTrainer:
-        del logger
-        return _FakeTrainer(callbacks[0], fail=next(failures))
-
-    monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", _logger_factory)
-    monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
-    monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
-
-    assert run_pretraining(_smoke_config(tmp_path / "success", max_steps=2)).is_file()
-    assert not active
-
-    with pytest.raises(RuntimeError, match="forced trainer failure"):
-        run_pretraining(_smoke_config(tmp_path / "failure", max_steps=2))
-
-    assert not active
-    assert exit_codes == [0, 1]
-
-
-def test_wandb_cleanup_does_not_mask_training_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    logger = SimpleNamespace(
-        experiment=SimpleNamespace(
-            finish=lambda **_: (_ for _ in ()).throw(RuntimeError("cleanup failure"))
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            check=True,
+            capture_output=True,
+            env=environment,
+            text=True,
         )
-    )
-
-    def _trainer_factory(
-        _cfg: DictConfig, *, logger: object, callbacks: list[object]
-    ) -> _FakeTrainer:
-        del logger
-        return _FakeTrainer(callbacks[0], fail=True)
-
-    monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: logger)
-    monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
-    monkeypatch.setattr("marineworld.train.pretrain.build_module", lambda _: object())
-
-    with pytest.raises(RuntimeError, match="forced trainer failure"):
-        run_pretraining(_smoke_config(tmp_path, max_steps=2))
-
-
-def test_local_smoke_saves_best_and_last_then_resumes(tmp_path: Path) -> None:
-    cfg = _smoke_config(tmp_path, max_steps=2)
-
-    first_checkpoint = run_pretraining(cfg)
-
-    assert first_checkpoint == tmp_path / "output" / "checkpoints" / "last.ckpt"
-    assert first_checkpoint.exists()
-    assert any(path.name != "last.ckpt" for path in first_checkpoint.parent.glob("*.ckpt"))
-    first_state = torch.load(first_checkpoint, map_location="cpu", weights_only=False)
-    assert first_state["global_step"] == 2
-
-    resumed = OmegaConf.merge(
-        cfg,
-        {"runtime": {"max_steps": 3, "ckpt_path": str(first_checkpoint)}},
-    )
-    second_checkpoint = run_pretraining(resumed)
-
-    state = torch.load(second_checkpoint, map_location="cpu", weights_only=False)
-    assert state["global_step"] == 3
-
-
-def test_local_smoke_saves_last_checkpoint_on_exception(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    original_training_step = VideoMAEPretrainingModule.training_step
-
-    def _fail_after_first_step(
-        module: VideoMAEPretrainingModule,
-        batch: dict[str, object],
-        batch_idx: int,
-    ) -> torch.Tensor:
-        if module.global_step == 1:
-            raise RuntimeError("forced training failure")
-        return original_training_step(module, batch, batch_idx)
-
-    monkeypatch.setattr(VideoMAEPretrainingModule, "training_step", _fail_after_first_step)
-    cfg = _smoke_config(tmp_path, max_steps=2)
-
-    with pytest.raises(RuntimeError, match="forced training failure"):
-        run_pretraining(cfg)
-
-    checkpoint = tmp_path / "output" / "checkpoints" / "last.ckpt"
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    assert state["global_step"] == 1
-
-
-def test_offline_smoke_creates_local_wandb_run_without_network(
-    tmp_path: Path,
-) -> None:
-    wandb_dir = tmp_path / "wandb-data"
-    wandb_dir.mkdir()
-    output_dir = tmp_path / "output"
-    data_root = tmp_path / "data"
-    environment = os.environ | {
-        "KMP_USE_SHM": "0",
-        "TMPDIR": "/tmp",
-        "WANDB_BASE_URL": "http://127.0.0.1:9",
-        "WANDB_DIR": str(wandb_dir),
-        "WANDB_MODE": "offline",
-    }
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "marineworld.train.pretrain",
-            "data=synthetic",
-            "model=videomae_tiny",
-            "runtime=local_smoke",
-            f"data.root={data_root}",
-            f"output_dir={output_dir}",
-        ],
-        check=True,
-        capture_output=True,
-        cwd=wandb_dir,
-        env=environment,
-        text=True,
-        timeout=180,
-    )
-
-    assert (output_dir / "checkpoints" / "last.ckpt").exists()
-    assert any(wandb_dir.rglob("offline-run-*"))
-    assert "W&B syncing is set to `offline`" in result.stderr
-
-
-def test_tube_mask_has_exact_ratio() -> None:
-    mask = tube_mask(
-        2,
-        sequence_length=80,
-        mask_ratio=0.9,
-        generator=torch.Generator().manual_seed(42),
-    )
 
-    assert mask.dtype == torch.bool
-    assert mask.shape == (2, 80)
-    assert mask.sum(dim=1).tolist() == [72, 72]
-
-
-def test_mask_for_step_is_reproducible_after_resume() -> None:
-    first = VideoMAEPretrainingModule(_tiny_model_config(), seed=42)
-    resumed = VideoMAEPretrainingModule(_tiny_model_config(), seed=42)
-
-    step_three = first.make_mask(1, torch.device("cpu"), step=3)
-    resumed_step_three = resumed.make_mask(1, torch.device("cpu"), step=3)
-    expected_step_four = tube_mask(1, 8, 0.5, torch.Generator().manual_seed(46))
-
-    assert torch.equal(step_three, resumed_step_three)
-    assert torch.equal(first.make_mask(1, torch.device("cpu"), step=4), expected_step_four)
-
-
-def test_masks_are_unique_per_accumulated_microbatch() -> None:
-    module = VideoMAEPretrainingModule(_tiny_model_config(), seed=42)
-
-    first = module.make_mask(1, torch.device("cpu"), step=3, microbatch=0)
-    second = module.make_mask(1, torch.device("cpu"), step=3, microbatch=1)
-
-    assert not torch.equal(first, second)
-
-
-def test_training_logs_lr_and_grad_norm_under_the_pretrain_stage(
-    tmp_path: Path, tiny_batch: dict[str, torch.Tensor]
-) -> None:
-    """The cosine schedule is only observable if the LR it produces is logged."""
-    logged: dict[str, float] = {}
-    module = VideoMAEPretrainingModule(_tiny_model_config(), warmup_epochs=0, max_epochs=1)
-    module.log = lambda name, value, **_: logged.__setitem__(name, float(value))  # type: ignore[method-assign]
-    trainer = Trainer(
-        max_steps=1,
-        limit_train_batches=1,
-        logger=False,
-        enable_checkpointing=False,
-        enable_progress_bar=False,
-        accelerator="cpu",
-        default_root_dir=str(tmp_path),
-    )
-
-    trainer.fit(module, train_dataloaders=DataLoader([tiny_batch], batch_size=None))
-
-    assert logged["pretrain/lr"] > 0
-    assert logged["pretrain/grad_norm"] > 0
-
-
-def test_scheduler_without_trainer_requires_an_explicit_step_budget() -> None:
-    module = VideoMAEPretrainingModule(_tiny_model_config(), warmup_epochs=1, max_epochs=4)
-
-    with pytest.raises(RuntimeError, match="attach a Trainer or pass total_steps"):
-        module.configure_optimizers()
-
-
-def test_optimizer_uses_warmup_cosine_scheduler() -> None:
-    module = VideoMAEPretrainingModule(
-        _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4, total_steps=8
-    )
-    configured = module.configure_optimizers()
-
-    assert configured["lr_scheduler"]["interval"] == "step"
-    scheduler = configured["lr_scheduler"]["scheduler"]
-    initial = scheduler.get_last_lr()[0]
-    values = []
-    for _ in range(8):
-        scheduler.optimizer.step()
-        scheduler.step()
-        values.append(scheduler.get_last_lr()[0])
-    assert initial < values[0]
-    assert values[-1] < values[2]
-
-    resumed_module = VideoMAEPretrainingModule(
-        _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4, total_steps=8
-    )
-    resumed = resumed_module.configure_optimizers()["lr_scheduler"]["scheduler"]
-    resumed.load_state_dict(scheduler.state_dict())
-    assert resumed.get_last_lr() == scheduler.get_last_lr()
-
-
-def test_scheduler_uses_trainer_optimizer_step_estimate() -> None:
-    module = VideoMAEPretrainingModule(_tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4)
-    module._trainer = SimpleNamespace(estimated_stepping_batches=4)
-    scheduler = module.configure_optimizers()["lr_scheduler"]["scheduler"]
-
-    for _ in range(4):
-        scheduler.optimizer.step()
-        scheduler.step()
-
-    assert scheduler.get_last_lr() == [0.0]
-
-
-def test_training_manifest_records_exact_splits_without_raw_paths(tmp_path: Path) -> None:
-    _, manifest = _fvessel_manifest(tmp_path / "restricted", videos=2)
-
-    path = write_training_manifest(manifest, tmp_path / "artifacts")
-    payload = json.loads(path.read_text())
-
-    assert payload["manifest_checksum"] == manifest_checksum(manifest)
-    assert {record["id"] for record in payload["records"]} == {
-        record.id for record in manifest.records
-    }
-    assert "video_path" not in path.read_text()
-    assert str(tmp_path / "restricted") not in path.read_text()
-
-
-@pytest.mark.parametrize(
-    ("update", "value"),
-    [
-        ("data.sampling_weights.smd", 0.9),
-        ("data.transforms.train.color_jitter", 0.2),
-        ("train.warmup_epochs", 20),
-    ],
-)
-def test_training_identity_hashes_material_scientific_config(
-    tmp_path: Path, update: str, value: object
-) -> None:
-    cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
-    first = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
-    baseline = training_run_identity(cfg, first)
-    OmegaConf.update(cfg, update, value)
-
-    assert training_run_identity(cfg, first).condition_id != baseline.condition_id
-
-
-def test_training_identity_ignores_execution_hardware(tmp_path: Path) -> None:
-    manifest = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
-    l4 = _compose_config("data=joint_synthetic", "model=videomae_tiny", "runtime=l4")
-    a100 = _compose_config("data=joint_synthetic", "model=videomae_tiny", "runtime=a100")
-    a100.runtime.batch_size = l4.runtime.batch_size
-    a100.runtime.accumulate_grad_batches = l4.runtime.accumulate_grad_batches
-
-    assert (
-        training_run_identity(l4, manifest).condition_id
-        == training_run_identity(a100, manifest).condition_id
-    )
-
-
-def test_training_identity_is_stable_across_resume_horizon(tmp_path: Path) -> None:
-    manifest = SyntheticAdapter(num_frames=4, num_videos=2).build_manifest(tmp_path / "data")
-    first = _smoke_config(tmp_path, max_steps=2)
-    resumed = OmegaConf.merge(
-        first,
-        {
-            "runtime": {
-                "max_steps": 3,
-                "limit_train_batches": 1,
-                "limit_val_batches": 1,
-                "ckpt_path": str(tmp_path / "last.ckpt"),
-            }
-        },
-    )
-
-    assert (
-        training_run_identity(first, manifest).condition_id
-        == training_run_identity(resumed, manifest, "sha256:resume").condition_id
-    )
-
-
-def test_sampler_callback_advances_relative_to_restored_position() -> None:
-    sampler = BalancedDatasetSampler(("smd",) * 4 + ("fvessel",) * 4, seed=42)
-    callback = BalancedSamplerCheckpoint(sampler, batch_size=2)
-    callback.load_state_dict({"epoch": 0, "position": 4})
-
-    callback.on_train_batch_end(None, None, None, None, batch_idx=0)  # type: ignore[arg-type]
-    assert sampler.position == 6
-    callback.on_train_batch_end(None, None, None, None, batch_idx=1)  # type: ignore[arg-type]
-
-    assert sampler.position == 8
-
-
-def test_joint_split_preserves_each_component_in_training(tmp_path: Path) -> None:
-    composite = CompositeAdapter(
-        components={
-            "smd": SyntheticAdapter(num_frames=4, num_videos=2),
-            "fvessel": SyntheticAdapter(num_frames=4, num_videos=2),
-        },
-        roots={"smd": tmp_path / "smd", "fvessel": tmp_path / "fvessel"},
-    )
-    manifest = composite.build_manifest(tmp_path)
-    manifest = replace(
-        manifest,
-        records=tuple(replace(record, split="train") for record in manifest.records),
-    )
-    cfg = _compose_config("data=joint_synthetic", "model=videomae_tiny")
-    cfg.seed = 5
-
-    prepared = prepare_training_manifest(cfg, manifest)
-
-    assert {record.dataset for record in prepared.records if record.split == "train"} == {
-        "smd",
-        "fvessel",
-    }
-
-
-def test_draw_tokens_vary_by_epoch_and_replay_after_resume(tmp_path: Path) -> None:
-    cfg = _smoke_config(tmp_path, max_steps=2)
-    adapter = SyntheticAdapter(num_frames=4, num_videos=4)
-    manifest = adapter.build_manifest(tmp_path / "data")
-    loader = build_dataloaders(cfg, manifest)["train_dataloaders"]
-    sampler = loader.sampler
-    assert isinstance(sampler, BalancedDatasetSampler)
-    dataset = loader.dataset
-
-    first_draw = list(sampler)[0]
-    sampler.set_epoch(1)
-    second_draw = list(sampler)[0]
-    assert not torch.equal(
-        dataset[first_draw]["pixel_values"], dataset[second_draw]["pixel_values"]
-    )
-
-    sampler.set_epoch(3)
-    sampler.position = 1
-    state = sampler.state_dict()
-    remaining = list(sampler)
-    replay = BalancedDatasetSampler(
-        tuple("synthetic" for _ in range(len(dataset))),
-        seed=int(cfg.seed),
-        draw_tokens=True,
-    )
-    replay.load_state_dict(state)
-    replayed = list(replay)
-    assert replayed == remaining
-    assert all(
-        torch.equal(dataset[left]["pixel_values"], dataset[right]["pixel_values"])
-        for left, right in zip(remaining, replayed, strict=True)
-    )
-
-    val_dataset = build_dataloaders(cfg, manifest)["val_dataloaders"].dataset
-    assert torch.equal(val_dataset[0]["pixel_values"], val_dataset[0]["pixel_values"])
-
-
-def test_encode_video_preserves_batch_token_and_hidden_layout(
-    tiny_batch: dict[str, torch.Tensor],
-) -> None:
-    model = build_videomae(_tiny_model_config())
-
-    embeddings = encode_video(model, tiny_batch["pixel_values"])
-
-    assert embeddings.shape == (1, 8, 32)
-
-
-def test_training_step_rejects_non_finite_loss(
-    monkeypatch: pytest.MonkeyPatch, tiny_batch: dict[str, torch.Tensor]
-) -> None:
-    module = VideoMAEPretrainingModule(_tiny_model_config())
-
-    def _nan_loss(**_: torch.Tensor) -> object:
-        return type("Output", (), {"loss": torch.tensor(float("nan"))})()
-
-    monkeypatch.setattr(module.model, "forward", _nan_loss)
-
-    with pytest.raises(FloatingPointError, match="non-finite training loss at batch 7"):
-        module.training_step(tiny_batch, 7)
-
-
-def test_tiny_pretraining_step_updates_parameters(tiny_batch: dict[str, torch.Tensor]) -> None:
-    module = VideoMAEPretrainingModule(_tiny_model_config(), lr=1e-3, weight_decay=0.0)
-    before = next(module.parameters()).detach().clone()
-    trainer = Trainer(
-        max_steps=1,
-        accelerator="cpu",
-        logger=False,
-        enable_checkpointing=False,
-        enable_progress_bar=False,
-        enable_model_summary=False,
-    )
-
-    trainer.fit(module, train_dataloaders=DataLoader([tiny_batch], batch_size=None))
-
-    assert not torch.equal(before, next(module.parameters()).detach())
-
-
-def test_pretraining_module_receives_configured_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _compose_config("model=videomae_tiny")
-    captured: dict[str, object] = {}
-
-    def _module_factory(*args: object, **kwargs: object) -> object:
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr("marineworld.train.pretrain.VideoMAEPretrainingModule", _module_factory)
-    build_module(cfg)
-
-    assert captured["warmup_epochs"] == cfg.train.warmup_epochs
-
-
-@pytest.mark.parametrize("warmup_epochs", [-1, 101])
-def test_pretraining_module_rejects_invalid_warmup(warmup_epochs: int) -> None:
-    cfg = _compose_config("model=videomae_tiny", f"train.warmup_epochs={warmup_epochs}")
-
-    with pytest.raises(ValueError, match="warmup_epochs"):
+        assert json.loads(result.stdout) == {"torch": False, "transformers": False}
+
+    def test_empty_data_root_cli_exits_without_checkpoint(self, tmp_path: Path) -> None:
+        root = tmp_path / "empty"
+        output_dir = tmp_path / "output"
+        root.mkdir()
+        environment = os.environ | {"KMP_USE_SHM": "0", "TMPDIR": "/tmp"}
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "marineworld.train.pretrain",
+                "data=fvessel",
+                "model=videomae_tiny",
+                "runtime=local_smoke",
+                "data.adapter.fps=30",
+                f"data.root={root}",
+                f"output_dir={output_dir}",
+            ],
+            capture_output=True,
+            cwd=tmp_path,
+            env=environment,
+            text=True,
+            timeout=180,
+        )
+
+        assert result.returncode != 0
+        assert "manifest contains no records" in result.stderr
+        assert not (output_dir / "checkpoints").exists()
+
+    def test_offline_smoke_creates_local_wandb_run_without_network(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        wandb_dir = tmp_path / "wandb-data"
+        wandb_dir.mkdir()
+        output_dir = tmp_path / "output"
+        data_root = tmp_path / "data"
+        environment = os.environ | {
+            "KMP_USE_SHM": "0",
+            "TMPDIR": "/tmp",
+            "WANDB_BASE_URL": "http://127.0.0.1:9",
+            "WANDB_DIR": str(wandb_dir),
+            "WANDB_MODE": "offline",
+        }
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "marineworld.train.pretrain",
+                "data=synthetic",
+                "model=videomae_tiny",
+                "runtime=local_smoke",
+                f"data.root={data_root}",
+                f"output_dir={output_dir}",
+            ],
+            check=True,
+            capture_output=True,
+            cwd=wandb_dir,
+            env=environment,
+            text=True,
+            timeout=180,
+        )
+
+        assert (output_dir / "checkpoints" / "last.ckpt").exists()
+        assert any(wandb_dir.rglob("offline-run-*"))
+        assert "W&B syncing is set to `offline`" in result.stderr
+
+
+class TestPretrainingModule:
+    """VideoMAE masking, loss, parameter updates and warmup config."""
+
+    def test_tube_mask_has_exact_ratio(self) -> None:
+        mask = tube_mask(
+            2,
+            sequence_length=80,
+            mask_ratio=0.9,
+            generator=torch.Generator().manual_seed(42),
+        )
+
+        assert mask.dtype == torch.bool
+        assert mask.shape == (2, 80)
+        assert mask.sum(dim=1).tolist() == [72, 72]
+
+    def test_mask_for_step_is_reproducible_after_resume(self) -> None:
+        first = VideoMAEPretrainingModule(_tiny_model_config(), seed=42)
+        resumed = VideoMAEPretrainingModule(_tiny_model_config(), seed=42)
+
+        step_three = first.make_mask(1, torch.device("cpu"), step=3)
+        resumed_step_three = resumed.make_mask(1, torch.device("cpu"), step=3)
+        expected_step_four = tube_mask(1, 8, 0.5, torch.Generator().manual_seed(46))
+
+        assert torch.equal(step_three, resumed_step_three)
+        assert torch.equal(first.make_mask(1, torch.device("cpu"), step=4), expected_step_four)
+
+    def test_masks_are_unique_per_accumulated_microbatch(self) -> None:
+        module = VideoMAEPretrainingModule(_tiny_model_config(), seed=42)
+
+        first = module.make_mask(1, torch.device("cpu"), step=3, microbatch=0)
+        second = module.make_mask(1, torch.device("cpu"), step=3, microbatch=1)
+
+        assert not torch.equal(first, second)
+
+    def test_training_logs_lr_and_grad_norm_under_the_pretrain_stage(
+        self, tmp_path: Path, tiny_batch: dict[str, torch.Tensor]
+    ) -> None:
+        """The cosine schedule is only observable if the LR it produces is logged."""
+        logged: dict[str, float] = {}
+        module = VideoMAEPretrainingModule(_tiny_model_config(), warmup_epochs=0, max_epochs=1)
+        module.log = lambda name, value, **_: logged.__setitem__(name, float(value))  # type: ignore[method-assign]
+        trainer = Trainer(
+            max_steps=1,
+            limit_train_batches=1,
+            logger=False,
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+            accelerator="cpu",
+            default_root_dir=str(tmp_path),
+        )
+
+        trainer.fit(module, train_dataloaders=DataLoader([tiny_batch], batch_size=None))
+
+        assert logged["pretrain/lr"] > 0
+        assert logged["pretrain/grad_norm"] > 0
+
+    def test_encode_video_preserves_batch_token_and_hidden_layout(
+        self,
+        tiny_batch: dict[str, torch.Tensor],
+    ) -> None:
+        model = build_videomae(_tiny_model_config())
+
+        embeddings = encode_video(model, tiny_batch["pixel_values"])
+
+        assert embeddings.shape == (1, 8, 32)
+
+    def test_training_step_rejects_non_finite_loss(
+        self, monkeypatch: pytest.MonkeyPatch, tiny_batch: dict[str, torch.Tensor]
+    ) -> None:
+        module = VideoMAEPretrainingModule(_tiny_model_config())
+
+        def _nan_loss(**_: torch.Tensor) -> object:
+            return type("Output", (), {"loss": torch.tensor(float("nan"))})()
+
+        monkeypatch.setattr(module.model, "forward", _nan_loss)
+
+        with pytest.raises(FloatingPointError, match="non-finite training loss at batch 7"):
+            module.training_step(tiny_batch, 7)
+
+    def test_tiny_pretraining_step_updates_parameters(
+        self, tiny_batch: dict[str, torch.Tensor]
+    ) -> None:
+        module = VideoMAEPretrainingModule(_tiny_model_config(), lr=1e-3, weight_decay=0.0)
+        before = next(module.parameters()).detach().clone()
+        trainer = Trainer(
+            max_steps=1,
+            accelerator="cpu",
+            logger=False,
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+        )
+
+        trainer.fit(module, train_dataloaders=DataLoader([tiny_batch], batch_size=None))
+
+        assert not torch.equal(before, next(module.parameters()).detach())
+
+    def test_pretraining_module_receives_configured_warmup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _compose_config("model=videomae_tiny")
+        captured: dict[str, object] = {}
+
+        def _module_factory(*args: object, **kwargs: object) -> object:
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr("marineworld.train.pretrain.VideoMAEPretrainingModule", _module_factory)
         build_module(cfg)
+
+        assert captured["warmup_epochs"] == cfg.train.warmup_epochs
+
+    @pytest.mark.parametrize("warmup_epochs", [-1, 101])
+    def test_pretraining_module_rejects_invalid_warmup(self, warmup_epochs: int) -> None:
+        cfg = _compose_config("model=videomae_tiny", f"train.warmup_epochs={warmup_epochs}")
+
+        with pytest.raises(ValueError, match="warmup_epochs"):
+            build_module(cfg)
+
+
+class TestScheduler:
+    """Warmup-cosine LR schedule shape and step budget."""
+
+    def test_scheduler_without_trainer_requires_an_explicit_step_budget(self) -> None:
+        module = VideoMAEPretrainingModule(_tiny_model_config(), warmup_epochs=1, max_epochs=4)
+
+        with pytest.raises(RuntimeError, match="attach a Trainer or pass total_steps"):
+            module.configure_optimizers()
+
+    def test_optimizer_uses_warmup_cosine_scheduler(self) -> None:
+        module = VideoMAEPretrainingModule(
+            _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4, total_steps=8
+        )
+        configured = module.configure_optimizers()
+
+        assert configured["lr_scheduler"]["interval"] == "step"
+        scheduler = configured["lr_scheduler"]["scheduler"]
+        initial = scheduler.get_last_lr()[0]
+        values = []
+        for _ in range(8):
+            scheduler.optimizer.step()
+            scheduler.step()
+            values.append(scheduler.get_last_lr()[0])
+        assert initial < values[0]
+        assert values[-1] < values[2]
+
+        resumed_module = VideoMAEPretrainingModule(
+            _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4, total_steps=8
+        )
+        resumed = resumed_module.configure_optimizers()["lr_scheduler"]["scheduler"]
+        resumed.load_state_dict(scheduler.state_dict())
+        assert resumed.get_last_lr() == scheduler.get_last_lr()
+
+    def test_scheduler_uses_trainer_optimizer_step_estimate(self) -> None:
+        module = VideoMAEPretrainingModule(
+            _tiny_model_config(), lr=1e-3, warmup_epochs=1, max_epochs=4
+        )
+        module._trainer = SimpleNamespace(estimated_stepping_batches=4)
+        scheduler = module.configure_optimizers()["lr_scheduler"]["scheduler"]
+
+        for _ in range(4):
+            scheduler.optimizer.step()
+            scheduler.step()
+
+        assert scheduler.get_last_lr() == [0.0]
