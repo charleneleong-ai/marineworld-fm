@@ -18,7 +18,13 @@ from typer.testing import CliRunner
 
 from marineworld.data import download as download_module
 from marineworld.data import video as video_module
-from marineworld.data.adapters import CompositeAdapter, DatasetAdapter, build_adapter
+from marineworld.data.adapters import (
+    CompositeAdapter,
+    DatasetAdapter,
+    FrameCountCache,
+    build_adapter,
+    resolve_frame_count,
+)
 from marineworld.data.clips import (
     AutoVideoDecoder,
     DecordVideoDecoder,
@@ -933,3 +939,57 @@ def test_clip_dataset_caches_and_filters_adapter_targets(
     assert [target.frame_index for target in first["targets"]] == [0, 2]
     assert [target.frame_index for target in second["targets"]] == [4]
     assert calls == 1
+
+
+class CountingProbe:
+    """A frame-count probe that records how many videos it was asked to decode."""
+
+    def __init__(self, value: int = 96) -> None:
+        self.value = value
+        self.calls: list[Path] = []
+
+    def __call__(self, video: Path) -> int:
+        self.calls.append(video)
+        return self.value
+
+
+class TestFrameCountCache:
+    """Persisted frame counts so a damaged corpus is decoded once, not per run."""
+
+    def test_second_build_reuses_the_persisted_count(self, tmp_path: Path) -> None:
+        root = tmp_path / "fvessel"
+        (root / "sample-01").mkdir(parents=True)
+        (root / "sample-01" / "clip.mp4").write_bytes(b"video")
+        probe = CountingProbe()
+        adapter = FVesselAdapter(version="fixture", fps=30.0, frame_count_probe=probe)
+
+        first = adapter.build_manifest(root)
+        second = adapter.build_manifest(root)
+
+        assert first.records[0].num_frames == 96
+        assert second.records[0].num_frames == 96
+        assert len(probe.calls) == 1  # decoded once, reused on the second build
+        assert (root / ".marineworld_frame_counts.json").is_file()
+
+    def test_a_changed_video_is_recounted(self, tmp_path: Path) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"first")
+        probe = CountingProbe()
+
+        resolve_frame_count(None, video, probe, "T", FrameCountCache.for_root(tmp_path))
+        video.write_bytes(b"second-and-longer")  # different size invalidates the entry
+        resolve_frame_count(None, video, probe, "T", FrameCountCache.for_root(tmp_path))
+
+        assert len(probe.calls) == 2
+
+    def test_a_read_only_data_dir_still_builds(self, tmp_path: Path) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"video")
+        probe = CountingProbe(42)
+        cache = FrameCountCache(tmp_path / "nonexistent-subdir" / "cache.json")
+        cache.path.parent.mkdir()
+        cache.path.parent.chmod(0o500)  # unwritable
+        try:
+            assert resolve_frame_count(None, video, probe, "T", cache) == 42
+        finally:
+            cache.path.parent.chmod(0o700)

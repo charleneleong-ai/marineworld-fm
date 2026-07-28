@@ -23,7 +23,7 @@ from typing import Callable
 
 import numpy as np
 
-from marineworld.data.adapters import resolve_fps, resolve_frame_count
+from marineworld.data.adapters import FrameCountCache, resolve_fps, resolve_frame_count
 from marineworld.data.alignment import (
     AISRecord,
     align_tracks_to_frames,
@@ -47,7 +47,8 @@ class FVesselAdapter:
     frame_count_probe: Callable[[Path], int] = probe_video_frame_count
 
     def build_manifest(self, root: Path) -> DatasetManifest:
-        records = tuple(self._record(root, video) for video in sorted(root.rglob("*.mp4")))
+        cache = FrameCountCache.for_root(root)
+        records = tuple(self._record(root, video, cache) for video in sorted(root.rglob("*.mp4")))
         return DatasetManifest(
             "fvessel",
             self.version,
@@ -107,7 +108,7 @@ class FVesselAdapter:
             for frame_index, entries in sorted(frames.items())
         )
 
-    def _record(self, root: Path, video: Path) -> VideoRecord:
+    def _record(self, root: Path, video: Path, cache: FrameCountCache) -> VideoRecord:
         annotation = FVesselAdapter.mot_path(video.parent)
         return VideoRecord(
             id=video.relative_to(root).with_suffix("").as_posix(),
@@ -117,7 +118,7 @@ class FVesselAdapter:
             source=video.parent.name,
             fps=resolve_fps(self.fps, video, self.fps_probe, "FVessel"),
             num_frames=resolve_frame_count(
-                self.num_frames, video, self.frame_count_probe, "FVessel"
+                self.num_frames, video, self.frame_count_probe, "FVessel", cache
             ),
             annotation_path=annotation,
             metadata={"has_ais": (video.parent / "ais").is_dir()},

@@ -16,7 +16,7 @@ from typing import Callable, Literal
 
 import numpy as np
 
-from marineworld.data.adapters import resolve_frame_count
+from marineworld.data.adapters import FrameCountCache, resolve_frame_count
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 from marineworld.data.video import probe_video_frame_count
 
@@ -57,6 +57,7 @@ class SMDAdapter:
         self._validate_annotation_format()
         videos = SMDAdapter.list_videos(root)
         SMDAdapter.validate_objectgt_pairing(videos)
+        cache = FrameCountCache.for_root(root)
         records = tuple(
             VideoRecord(
                 id=video.path.relative_to(root).with_suffix("").as_posix(),
@@ -66,7 +67,7 @@ class SMDAdapter:
                 source=video.source,
                 fps=self.fps,
                 num_frames=resolve_frame_count(
-                    self.num_frames, video.path, self.frame_count_probe, "SMD"
+                    self.num_frames, video.path, self.frame_count_probe, "SMD", cache
                 ),
                 annotation_path=SMDAdapter.objectgt_path(video.path),
                 metadata={
