@@ -92,7 +92,7 @@ def _target(frame_index: int) -> FrameTargets:
     )
 
 
-class _WrongLengthDecoder:
+class WrongLengthDecoder:
     def decode(self, record: VideoRecord, frame_indices: tuple[int, ...]) -> torch.Tensor:
         del record
         return torch.zeros((len(frame_indices) - 1, 3, 32, 32))
@@ -651,7 +651,7 @@ def test_clip_dataset_rejects_wrong_decoder_length(
 ) -> None:
     dataset = MaritimeClipDataset(
         synthetic_manifest,
-        _WrongLengthDecoder(),
+        WrongLengthDecoder(),
         split="train",
         frames=4,
         stride=1,
@@ -710,7 +710,7 @@ def test_frame_count_trusts_metadata_when_the_tail_decodes(
     assert checked == [99]
 
 
-class _HoleDecoder:
+class HoleDecoder:
     """Decode everything except an interior region, as damaged H.264 streams do."""
 
     def __init__(self, dead: range) -> None:
@@ -728,7 +728,7 @@ def test_dataset_drops_clips_it_cannot_decode_instead_of_failing_the_run(
     """Damage is not always a suffix, so a run must survive an interior hole."""
     dataset = MaritimeClipDataset(
         synthetic_manifest,
-        _HoleDecoder(range(4, 8)),
+        HoleDecoder(range(4, 8)),
         split="train",
         frames=2,
         stride=1,

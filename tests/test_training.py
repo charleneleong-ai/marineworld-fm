@@ -308,7 +308,7 @@ def _smoke_config(tmp_path: Path, *, max_steps: int) -> DictConfig:
     )
 
 
-class _FakeExperiment:
+class FakeExperiment:
     def __init__(self) -> None:
         self.calls: list[tuple[dict[str, object], int | None]] = []
         self.explicit_steps: list[int] = []
@@ -333,7 +333,7 @@ class _FakeExperiment:
 class WandbLogger:
     __module__ = "pytorch_lightning.loggers.wandb"
 
-    def __init__(self, experiment: _FakeExperiment) -> None:
+    def __init__(self, experiment: FakeExperiment) -> None:
         self.experiment = experiment
 
     def log_metrics(self, metrics: dict[str, object], step: int | None = None) -> None:
@@ -343,7 +343,7 @@ class WandbLogger:
         self.experiment.log(payload)
 
 
-class _FakeImage:
+class FakeImage:
     def __init__(self, data: object, caption: str) -> None:
         self.data = data
         self.caption = caption
@@ -395,8 +395,8 @@ class TestWandbMediaCallback:
         epoch: int,
         expected_calls: int,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
-        experiment = _FakeExperiment()
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
+        experiment = FakeExperiment()
         callback = _media_callback(SimpleNamespace(best_model_path=""), enabled=enabled)
         module = VideoMAEPretrainingModule(_tiny_model_config())
 
@@ -419,7 +419,7 @@ class TestWandbMediaCallback:
             assert step is None
             assert payload["trainer/global_step"] == 7
             media = {key: image for key, image in payload.items() if "/media/" in key}
-            assert all(isinstance(image, _FakeImage) for image in media.values())
+            assert all(isinstance(image, FakeImage) for image in media.values())
             assert all(
                 image.caption == "dataset=synthetic source=generated/clip-0"
                 for image in media.values()
@@ -438,8 +438,8 @@ class TestWandbMediaCallback:
         self, monkeypatch: pytest.MonkeyPatch, hook: str, stage: str, dataset: str
     ) -> None:
         """Joint runs must not overwrite one dataset's panel with another's."""
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
-        experiment = _FakeExperiment()
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
+        experiment = FakeExperiment()
         callback = _media_callback(SimpleNamespace(best_model_path=""))
 
         getattr(callback, hook)(
@@ -459,9 +459,9 @@ class TestWandbMediaCallback:
     @pytest.mark.parametrize(
         ("enabled", "logger"),
         [
-            (False, WandbLogger(_FakeExperiment())),
+            (False, WandbLogger(FakeExperiment())),
             (True, False),
-            (True, SimpleNamespace(experiment=_FakeExperiment())),
+            (True, SimpleNamespace(experiment=FakeExperiment())),
         ],
     )
     def test_media_callback_skips_inference_and_wandb_import_without_active_wandb(
@@ -486,8 +486,8 @@ class TestWandbMediaCallback:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
-        experiment = _FakeExperiment()
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
+        experiment = FakeExperiment()
         callback = _media_callback(SimpleNamespace(best_model_path=""))
 
         callback.on_validation_batch_end(
@@ -504,7 +504,7 @@ class TestWandbMediaCallback:
     def test_best_checkpoint_preview_uses_best_and_preserves_live_module(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
         model_config = _tiny_model_config() | {"norm_pix_loss": False}
         best = VideoMAEPretrainingModule(model_config)
         live = VideoMAEPretrainingModule(model_config)
@@ -518,7 +518,7 @@ class TestWandbMediaCallback:
         torch.save({"state_dict": best.state_dict()}, best_path)
         torch.save({"state_dict": live.state_dict()}, last_path)
         checkpoint = SimpleNamespace(best_model_path=str(best_path), last_model_path=str(last_path))
-        experiment = _FakeExperiment()
+        experiment = FakeExperiment()
         trainer = _media_trainer(WandbLogger(experiment), epoch=2)
         callback = _media_callback(checkpoint)
         callback.on_validation_batch_end(trainer, live, None, _media_batch(), 0)
@@ -539,7 +539,7 @@ class TestWandbMediaCallback:
         assert step is None
         assert payload["trainer/global_step"] == 7
         reconstruction = payload["best/synthetic/media/reconstruction"]
-        assert isinstance(reconstruction, _FakeImage)
+        assert isinstance(reconstruction, FakeImage)
         assert np.isclose(reconstruction.data[:, 32:48], 0.1).any()
         assert not np.isclose(reconstruction.data[:, 32:48], 0.9).any()
         assert all(
@@ -551,8 +551,8 @@ class TestWandbMediaCallback:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
-        experiment = _FakeExperiment()
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
+        experiment = FakeExperiment()
         trainer = _media_trainer(WandbLogger(experiment), epoch=2)
         module = VideoMAEPretrainingModule(_tiny_model_config())
         callback = _media_callback(SimpleNamespace(best_model_path=""))
@@ -567,11 +567,11 @@ class TestWandbMediaCallback:
     def test_best_checkpoint_preview_is_rank_zero_only(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
         module = VideoMAEPretrainingModule(_tiny_model_config())
         checkpoint_path = tmp_path / "best.ckpt"
         torch.save({"state_dict": module.state_dict()}, checkpoint_path)
-        experiment = _FakeExperiment()
+        experiment = FakeExperiment()
         trainer = _media_trainer(WandbLogger(experiment), epoch=2)
         callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
         callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
@@ -585,11 +585,11 @@ class TestWandbMediaCallback:
     def test_best_checkpoint_preview_uses_sample_from_non_periodic_epoch(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
         module = VideoMAEPretrainingModule(_tiny_model_config())
         checkpoint_path = tmp_path / "best.ckpt"
         torch.save({"state_dict": module.state_dict()}, checkpoint_path)
-        experiment = _FakeExperiment()
+        experiment = FakeExperiment()
         trainer = _media_trainer(WandbLogger(experiment), epoch=1)
         callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
 
@@ -608,11 +608,11 @@ class TestWandbMediaCallback:
     def test_media_callback_uses_lightning_logger_without_explicit_wandb_steps(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
         module = VideoMAEPretrainingModule(_tiny_model_config())
         checkpoint_path = tmp_path / "best.ckpt"
         torch.save({"state_dict": module.state_dict()}, checkpoint_path)
-        experiment = _FakeExperiment()
+        experiment = FakeExperiment()
         logger = WandbLogger(experiment)
         trainer = _media_trainer(logger, epoch=2)
         callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
@@ -634,7 +634,7 @@ class TestWandbMediaCallback:
     def test_best_checkpoint_preview_loads_checkpoint_with_safe_torch_options(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
         module = VideoMAEPretrainingModule(_tiny_model_config())
         checkpoint_path = tmp_path / "best.ckpt"
         calls: list[tuple[Path, dict[str, object]]] = []
@@ -644,7 +644,7 @@ class TestWandbMediaCallback:
             return {"state_dict": module.state_dict()}
 
         monkeypatch.setattr(torch, "load", _safe_load)
-        experiment = _FakeExperiment()
+        experiment = FakeExperiment()
         trainer = _media_trainer(WandbLogger(experiment), epoch=2)
         callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
         callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
@@ -673,7 +673,7 @@ class TestWandbMediaCallback:
         case: str,
         message: str,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
         sentinel = "PRIVATE-CHECKPOINT-PATH-SENTINEL"
         checkpoint_path = tmp_path / sentinel / f"{case}.ckpt"
         checkpoint_path.parent.mkdir()
@@ -682,7 +682,7 @@ class TestWandbMediaCallback:
         elif case == "incompatible":
             torch.save({"state_dict": {sentinel: torch.tensor(1)}}, checkpoint_path)
         module = VideoMAEPretrainingModule(_tiny_model_config())
-        experiment = _FakeExperiment()
+        experiment = FakeExperiment()
         trainer = _media_trainer(WandbLogger(experiment), epoch=2)
         callback = _media_callback(SimpleNamespace(best_model_path=str(checkpoint_path)))
         callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
@@ -700,13 +700,13 @@ class TestWandbMediaCallback:
     def test_best_checkpoint_preview_loads_real_lightning_checkpoint(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=_FakeImage))
+        monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage))
         last_checkpoint = run_pretraining(_smoke_config(tmp_path, max_steps=2))
         best_checkpoint = next(
             path for path in last_checkpoint.parent.glob("*.ckpt") if path != last_checkpoint
         )
         module = VideoMAEPretrainingModule(_tiny_model_config())
-        experiment = _FakeExperiment()
+        experiment = FakeExperiment()
         trainer = _media_trainer(WandbLogger(experiment), epoch=2)
         callback = _media_callback(SimpleNamespace(best_model_path=str(best_checkpoint)))
         callback.on_validation_batch_end(trainer, module, None, _media_batch(), 0)
@@ -795,7 +795,7 @@ def _write_reference_file(path: Path) -> None:
     path.write_bytes(b"same checkpoint")
 
 
-class _FakeTrainer:
+class FakeTrainer:
     def __init__(self, checkpoint: object, *, fail: bool) -> None:
         self.checkpoint = checkpoint
         self.fail = fail
@@ -809,7 +809,7 @@ class _FakeTrainer:
         self.checkpoint.last_model_path = str(path)
 
 
-class _CheckpointPathTrainer:
+class CheckpointPathTrainer:
     def __init__(self, checkpoint: object, path: str) -> None:
         self.checkpoint = checkpoint
         self.path = path
@@ -1467,9 +1467,9 @@ class TestPretrainingRun:
     ) -> None:
         def _trainer_factory(
             _cfg: DictConfig, *, logger: object, callbacks: list[object]
-        ) -> _CheckpointPathTrainer:
+        ) -> CheckpointPathTrainer:
             del logger
-            return _CheckpointPathTrainer(callbacks[0], last_path)
+            return CheckpointPathTrainer(callbacks[0], last_path)
 
         monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: False)
         monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
@@ -1498,9 +1498,9 @@ class TestPretrainingRun:
 
         def _trainer_factory(
             _cfg: DictConfig, *, logger: object, callbacks: list[object]
-        ) -> _FakeTrainer:
+        ) -> FakeTrainer:
             del logger
-            return _FakeTrainer(callbacks[0], fail=next(failures))
+            return FakeTrainer(callbacks[0], fail=next(failures))
 
         monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", _logger_factory)
         monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
@@ -1526,9 +1526,9 @@ class TestPretrainingRun:
 
         def _trainer_factory(
             _cfg: DictConfig, *, logger: object, callbacks: list[object]
-        ) -> _FakeTrainer:
+        ) -> FakeTrainer:
             del logger
-            return _FakeTrainer(callbacks[0], fail=True)
+            return FakeTrainer(callbacks[0], fail=True)
 
         monkeypatch.setattr("marineworld.train.pretrain.build_wandb_logger", lambda *_: logger)
         monkeypatch.setattr("marineworld.train.pretrain.build_trainer", _trainer_factory)
