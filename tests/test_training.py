@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -722,24 +723,28 @@ def test_best_checkpoint_preview_loads_real_lightning_checkpoint(
 
 
 @pytest.mark.parametrize(
-    ("key", "value"),
+    ("key", "value", "message"),
     [
-        ("media_log_every_n_epochs", 0),
-        ("media_log_every_n_epochs", -1),
-        ("media_log_every_n_epochs", "1"),
-        ("media_log_every_n_epochs", 1.5),
-        ("media_max_frames", 0),
-        ("media_max_frames", -1),
-        ("media_max_frames", 5),
-        ("media_max_frames", "4"),
-        ("media_max_frames", 1.5),
+        *[
+            (
+                "media_log_every_n_epochs",
+                value,
+                "tracking.media_log_every_n_epochs must be positive",
+            )
+            for value in (0, -1, "1", 1.5)
+        ],
+        *[
+            ("media_max_frames", value, "tracking.media_max_frames must be positive")
+            for value in (0, -1, 5, "4", 1.5)
+        ],
+        *[
+            ("log_media", value, "tracking.log_media must be boolean")
+            for value in ("false", "off", 1, 0, None)
+        ],
     ],
 )
-def test_media_config_rejects_non_positive_and_non_integer_values(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    key: str,
-    value: object,
+def test_media_config_rejects_invalid_values_before_construction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, value: object, message: str
 ) -> None:
     cfg = _smoke_config(tmp_path, max_steps=1)
     cfg.tracking[key] = value
@@ -752,26 +757,7 @@ def test_media_config_rejects_non_positive_and_non_integer_values(
         lambda *_: pytest.fail("config must fail before logger construction"),
     )
 
-    with pytest.raises(ValueError, match=f"tracking.{key} must be positive"):
-        run_pretraining(cfg)
-
-
-@pytest.mark.parametrize("value", ["false", "off", 1, 0, None])
-def test_media_config_rejects_non_boolean_log_media_before_construction(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
-) -> None:
-    cfg = _smoke_config(tmp_path, max_steps=1)
-    cfg.tracking.log_media = value
-    monkeypatch.setattr(
-        "marineworld.train.pretrain.build_data_adapter",
-        lambda *_: pytest.fail("config must fail before adapter construction"),
-    )
-    monkeypatch.setattr(
-        "marineworld.train.pretrain.build_wandb_logger",
-        lambda *_: pytest.fail("config must fail before logger construction"),
-    )
-
-    with pytest.raises(ValueError, match="tracking.log_media must be boolean"):
+    with pytest.raises(ValueError, match=message):
         run_pretraining(cfg)
 
 
@@ -805,6 +791,11 @@ def _write_reference_checkpoint(root: Path) -> None:
     root.mkdir(parents=True)
     (root / "config.json").write_text('{"model_type":"videomae"}')
     (root / "model.safetensors").write_bytes(b"weights")
+
+
+def _write_reference_file(path: Path) -> None:
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"same checkpoint")
 
 
 class _FakeTrainer:
@@ -869,18 +860,26 @@ def test_resolved_config_keeps_scientific_runtime_settings() -> None:
     assert "num_workers" not in runtime
 
 
-def test_reference_checkpoint_uses_portable_content_identity(tmp_path: Path) -> None:
-    first = tmp_path / "machine-a" / "reference.ckpt"
-    second = tmp_path / "machine-b" / "renamed.ckpt"
-    first.parent.mkdir()
-    second.parent.mkdir()
-    first.write_bytes(b"same checkpoint")
-    second.write_bytes(b"same checkpoint")
-    first_cfg = OmegaConf.create({"model": {"reference_checkpoint": str(first)}})
-    second_cfg = OmegaConf.create({"model": {"reference_checkpoint": str(second)}})
+@pytest.mark.parametrize(
+    ("machine_a", "machine_b", "make_checkpoint"),
+    [
+        ("machine-a/reference.ckpt", "machine-b/renamed.ckpt", _write_reference_file),
+        ("machine-a/saved-model", "machine-b/renamed-model", _write_reference_checkpoint),
+    ],
+)
+def test_reference_checkpoint_uses_portable_content_identity(
+    tmp_path: Path, machine_a: str, machine_b: str, make_checkpoint: Callable[[Path], None]
+) -> None:
+    first, second = tmp_path / machine_a, tmp_path / machine_b
+    make_checkpoint(first)
+    make_checkpoint(second)
 
-    first_resolved = resolved_config(first_cfg)
-    second_resolved = resolved_config(second_cfg)
+    first_resolved = resolved_config(
+        OmegaConf.create({"model": {"reference_checkpoint": str(first)}})
+    )
+    second_resolved = resolved_config(
+        OmegaConf.create({"model": {"reference_checkpoint": str(second)}})
+    )
     first_identity = build_run_identity(
         "videomae", ("manifest",), 42, None, logical_dimensions={"config": first_resolved}
     )
@@ -903,30 +902,6 @@ def test_reference_checkpoint_content_changes_condition(tmp_path: Path) -> None:
     second = resolved_config(cfg)
 
     assert first != second
-
-
-def test_reference_checkpoint_directory_uses_portable_content_identity(tmp_path: Path) -> None:
-    first = tmp_path / "machine-a" / "saved-model"
-    second = tmp_path / "machine-b" / "renamed-model"
-    for checkpoint in (first, second):
-        _write_reference_checkpoint(checkpoint)
-
-    first_resolved = resolved_config(
-        OmegaConf.create({"model": {"reference_checkpoint": str(first)}})
-    )
-    second_resolved = resolved_config(
-        OmegaConf.create({"model": {"reference_checkpoint": str(second)}})
-    )
-    first_identity = build_run_identity(
-        "videomae", ("manifest",), 42, None, logical_dimensions={"config": first_resolved}
-    )
-    second_identity = build_run_identity(
-        "videomae", ("manifest",), 42, None, logical_dimensions={"config": second_resolved}
-    )
-
-    assert first_resolved == second_resolved
-    assert first_identity.condition_id == second_identity.condition_id
-    assert str(tmp_path) not in json.dumps(first_resolved)
 
 
 @pytest.mark.parametrize(
