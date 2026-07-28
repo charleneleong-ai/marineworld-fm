@@ -332,41 +332,37 @@ def _frames_96(_: Path) -> int:
     return 96
 
 
-def _probe_config(tmp_path: Path, *overrides: str) -> Any:
+def _compose(*overrides: str) -> Any:
     config_dir = str(Path(__file__).parents[1] / "configs")
     with initialize_config_dir(version_base=None, config_dir=config_dir):
-        return compose(
-            config_name="config",
-            overrides=[
-                "data=synthetic",
-                "model=random",
-                "eval=probes",
-                "tracking.mode=disabled",
-                "eval.label_fractions=[1.0]",
-                "eval.seeds=[42]",
-                f"data.root={tmp_path / 'data'}",
-                f"output_dir={tmp_path / 'outputs'}",
-                *overrides,
-            ],
-        )
+        return compose(config_name="config", overrides=list(overrides))
+
+
+def _probe_config(tmp_path: Path, *overrides: str) -> Any:
+    return _compose(
+        "data=synthetic",
+        "model=random",
+        "eval=probes",
+        "tracking.mode=disabled",
+        "eval.label_fractions=[1.0]",
+        "eval.seeds=[42]",
+        f"data.root={tmp_path / 'data'}",
+        f"output_dir={tmp_path / 'outputs'}",
+        *overrides,
+    )
 
 
 def _unlabelled_smd_probe_config(tmp_path: Path) -> Any:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        return compose(
-            config_name="config",
-            overrides=[
-                "data=smd",
-                "model=random",
-                "eval=probes",
-                "tracking.mode=disabled",
-                "eval.label_fractions=[1.0]",
-                "eval.seeds=[42]",
-                f"data.root={tmp_path / 'smd'}",
-                f"output_dir={tmp_path / 'outputs'}",
-            ],
-        )
+    return _compose(
+        "data=smd",
+        "model=random",
+        "eval=probes",
+        "tracking.mode=disabled",
+        "eval.label_fractions=[1.0]",
+        "eval.seeds=[42]",
+        f"data.root={tmp_path / 'smd'}",
+        f"output_dir={tmp_path / 'outputs'}",
+    )
 
 
 def _wrapped_os_error(cause: Exception, message: str = "transformers wrapper") -> OSError:
@@ -1118,19 +1114,14 @@ def test_probe_rejects_unavailable_cuda_ordinal(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_probe_config_composes_and_disabled_synthetic_run_is_local(tmp_path: Path) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(
-            config_name="config",
-            overrides=[
-                "data=synthetic",
-                "model=random",
-                "eval=probes",
-                "tracking.mode=disabled",
-                f"data.root={tmp_path / 'data'}",
-                f"output_dir={tmp_path / 'outputs'}",
-            ],
-        )
+    cfg = _compose(
+        "data=synthetic",
+        "model=random",
+        "eval=probes",
+        "tracking.mode=disabled",
+        f"data.root={tmp_path / 'data'}",
+        f"output_dir={tmp_path / 'outputs'}",
+    )
 
     results = run_evaluation(cfg)
 
@@ -1643,19 +1634,14 @@ def test_mixed_result_table_preserves_skips_as_nonnumeric_none() -> None:
 def test_feature_extraction_honors_configured_batch_size(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(
-            config_name="config",
-            overrides=[
-                "data=synthetic",
-                "model=random",
-                "eval=probes",
-                "tracking.mode=disabled",
-                f"data.root={tmp_path / 'data'}",
-                "eval.batch_size=2",
-            ],
-        )
+    cfg = _compose(
+        "data=synthetic",
+        "model=random",
+        "eval=probes",
+        "tracking.mode=disabled",
+        f"data.root={tmp_path / 'data'}",
+        "eval.batch_size=2",
+    )
     encoder = BatchTrackingEncoder()
     monkeypatch.setattr(
         "marineworld.eval.run_probes.load_frozen_encoder",
@@ -1793,17 +1779,12 @@ def test_result_table_preserves_label_subset_membership() -> None:
 def test_wandb_mode_environment_disables_probe_logger(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(
-            config_name="config",
-            overrides=[
-                "data=synthetic",
-                "model=random",
-                "eval=probes",
-                f"data.root={tmp_path / 'data'}",
-            ],
-        )
+    cfg = _compose(
+        "data=synthetic",
+        "model=random",
+        "eval=probes",
+        f"data.root={tmp_path / 'data'}",
+    )
     observed_modes: list[str] = []
 
     def disabled_logger(config: Any, _: Any) -> bool:
@@ -1821,18 +1802,13 @@ def test_wandb_mode_environment_disables_probe_logger(
 def test_single_class_subset_is_reported_without_numeric_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(
-            config_name="config",
-            overrides=[
-                "data=synthetic",
-                "model=random",
-                "eval=probes",
-                "tracking.mode=disabled",
-                f"data.root={tmp_path / 'data'}",
-            ],
-        )
+    cfg = _compose(
+        "data=synthetic",
+        "model=random",
+        "eval=probes",
+        "tracking.mode=disabled",
+        f"data.root={tmp_path / 'data'}",
+    )
     monkeypatch.setattr("marineworld.eval.probes.sample_label", lambda *_: 0)
 
     results = run_evaluation(cfg)
@@ -1855,12 +1831,7 @@ def test_single_class_subset_is_reported_without_numeric_result(
 def test_reference_model_configs_compose_with_declared_input_contract(
     model: str, condition: str, image_size: int, num_frames: int
 ) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(
-            config_name="config",
-            overrides=[f"model={model}", "eval=probes"],
-        )
+    cfg = _compose(f"model={model}", "eval=probes")
 
     assert cfg.model.condition == condition
     assert cfg.model.image_size == image_size
@@ -1872,9 +1843,7 @@ def test_reference_model_configs_compose_with_declared_input_contract(
 
 
 def test_vjepa_real_data_config_builds_a_nonempty_clip_index(tmp_path: Path) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(config_name="config", overrides=["data=fvessel", "model=vjepa"])
+    cfg = _compose("data=fvessel", "model=vjepa")
     sample = tmp_path / "clip"
     (sample / "gt").mkdir(parents=True)
     (sample / "clip.mp4").touch()
@@ -1899,14 +1868,8 @@ def test_vjepa_real_data_config_builds_a_nonempty_clip_index(tmp_path: Path) -> 
 
 
 def test_random_vit_small_control_matches_maritime_architecture() -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        random_cfg = compose(
-            config_name="config", overrides=["model=random_vit_small", "eval=probes"]
-        )
-        maritime_cfg = compose(
-            config_name="config", overrides=["model=maritime_videomae", "eval=probes"]
-        )
+    random_cfg = _compose("model=random_vit_small", "eval=probes")
+    maritime_cfg = _compose("model=maritime_videomae", "eval=probes")
 
     architecture = (
         "image_size",
@@ -1923,15 +1886,8 @@ def test_random_vit_small_control_matches_maritime_architecture() -> None:
 
 
 def test_tiny_and_matched_random_controls_have_distinct_run_ids(tmp_path: Path) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        tiny = compose(
-            config_name="config", overrides=["data=synthetic", "model=random", "eval=probes"]
-        )
-        matched = compose(
-            config_name="config",
-            overrides=["data=synthetic", "model=random_vit_small", "eval=probes"],
-        )
+    tiny = _compose("data=synthetic", "model=random", "eval=probes")
+    matched = _compose("data=synthetic", "model=random_vit_small", "eval=probes")
     manifest = SyntheticAdapter().build_manifest(tmp_path)
 
     tiny_id = _probe_run_identity(tiny, manifest, "random-init", None)
@@ -2091,17 +2047,12 @@ def test_transformers_floor_supports_vjepa2_and_auto_video_processor() -> None:
 def test_missing_maritime_checkpoint_fails_before_logger(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(
-            config_name="config",
-            overrides=[
-                "data=synthetic",
-                "model=maritime_videomae",
-                "eval=probes",
-                f"data.root={tmp_path / 'data'}",
-            ],
-        )
+    cfg = _compose(
+        "data=synthetic",
+        "model=maritime_videomae",
+        "eval=probes",
+        f"data.root={tmp_path / 'data'}",
+    )
     monkeypatch.setattr(
         "marineworld.eval.run_probes.build_wandb_logger",
         lambda *_: pytest.fail("logger constructed before checkpoint validation"),
@@ -2140,20 +2091,15 @@ def test_dense_labels_map_source_boxes_to_spatiotemporal_tokens() -> None:
 def test_dense_probe_runs_through_result_matrix_without_encoder_updates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config_dir = str(Path(__file__).parents[1] / "configs")
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(
-            config_name="config",
-            overrides=[
-                "data=synthetic",
-                "model=random",
-                "eval=probes",
-                "eval.task=dense",
-                "eval.batch_size=1",
-                "tracking.mode=disabled",
-                f"data.root={tmp_path / 'data'}",
-            ],
-        )
+    cfg = _compose(
+        "data=synthetic",
+        "model=random",
+        "eval=probes",
+        "eval.task=dense",
+        "eval.batch_size=1",
+        "tracking.mode=disabled",
+        f"data.root={tmp_path / 'data'}",
+    )
     encoder = DenseFakeEncoder()
     before = {name: value.clone() for name, value in encoder.state_dict().items()}
     torch_cat = torch.cat
