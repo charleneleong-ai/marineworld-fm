@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned to commit SHAs (checkout v7.0.1, setup-uv v9.0.0).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          python-version-file: .python-version
+          enable-cache: true
+
+      - name: Install the locked environment
+        run: uv sync --all-extras
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Format check
+        run: uv run ruff format --check src tests
+
+      # C901/PLR0915 live in pyproject; select them explicitly so CI enforces the
+      # same gate as the pre-commit hook rather than relying on the config default.
+      - name: Complexity gate
+        run: uv run ruff check --select C901,PLR0915 src tests
+
+      - name: Tests
+        run: uv run pytest -q -p no:randomly

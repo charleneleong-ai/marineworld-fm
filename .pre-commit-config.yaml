@@ -25,11 +25,13 @@ repos:
         args: ["--fix", "--select", "E,W,F,I,C901,PLR0915"]
       - id: ruff-format
 
-  # Run the (fast, core-only) alignment + seed tests before pushing.
+  # Run the full suite before pushing. It needs the [train] extra and is not
+  # fast (the package pulls torch), so it is gated to pre-push, not per-commit;
+  # CI runs the same suite on every PR.
   - repo: local
     hooks:
-      - id: pytest-fast
-        name: pytest (fast unit tests)
+      - id: pytest
+        name: pytest (full suite)
         entry: pytest -q tests/
         language: system
         pass_filenames: false
