@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -12,12 +13,72 @@ from typing import Any, Mapping, Protocol
 from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecord
 from marineworld.data.manifest import manifest_checksum
 
+FRAME_COUNT_CACHE_NAME = ".marineworld_frame_counts.json"
+
+
+@dataclass
+class FrameCountCache:
+    """Persist verified frame counts, keyed on file size and mtime, across runs.
+
+    Counting the frames of a damaged video means decoding the whole stream, which
+    is paid once per corpus rather than on every manifest build. The cache lives
+    beside the data and is safe to delete; a read-only data directory falls back
+    to recomputing rather than failing the build.
+    """
+
+    path: Path
+    entries: dict[str, list[int]] = field(default_factory=dict)
+
+    @classmethod
+    def for_root(cls, root: Path) -> FrameCountCache:
+        cache = cls(Path(root) / FRAME_COUNT_CACHE_NAME)
+        try:
+            loaded = json.loads(cache.path.read_text())
+            cache.entries = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            cache.entries = {}
+        return cache
+
+    def resolve(self, video: Path, probe: Callable[[Path], int]) -> int:
+        # Keyed on (size, mtime) rather than content, unlike file_checksum: a stale
+        # count is a self-correcting optimisation (over-counts drop at decode time),
+        # not an identity digest, so the same-mtime-rewrite hazard is acceptable here.
+        try:
+            stat = video.stat()
+        except OSError:
+            return probe(video)
+        key = str(video.resolve())
+        cached = self.entries.get(key)
+        if cached and cached[:2] == [stat.st_size, stat.st_mtime_ns]:
+            return cached[2]
+        count = probe(video)
+        self.entries[key] = [stat.st_size, stat.st_mtime_ns, count]
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.entries, indent=2, sort_keys=True))
+        except OSError:
+            pass  # the cache is an optimisation; never let it break a build
+        return count
+
 
 def resolve_frame_count(
-    configured: int | None, video: Path, probe: Callable[[Path], int], dataset: str
+    configured: int | None,
+    video: Path,
+    probe: Callable[[Path], int],
+    dataset: str,
+    cache: FrameCountCache | None = None,
 ) -> int:
-    """Take the configured frame count, or probe the video, and require it positive."""
-    count = configured if configured is not None else probe(video)
+    """Take the configured frame count, or probe the video, and require it positive.
+
+    When a cache is given, the probe result is reused across runs so a damaged
+    corpus is decoded to count its frames only when the file changes.
+    """
+    if configured is not None:
+        count = configured
+    elif cache is not None:
+        count = cache.resolve(video, probe)
+    else:
+        count = probe(video)
     if count <= 0:
         raise ValueError(f"{dataset} frame count must be positive for {video}, got {count}")
     return count
