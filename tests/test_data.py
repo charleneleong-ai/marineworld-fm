@@ -758,125 +758,139 @@ def test_collate_drops_undecodable_samples_but_refuses_an_empty_batch() -> None:
         drop_undecodable([None, None])
 
 
-def test_auto_decoder_prefers_decord(
-    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[str] = []
-    frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
-    monkeypatch.setattr(video_module, "_decord_decode", lambda *_: calls.append("decord") or frames)
-    monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: calls.append("pyav") or frames)
+class TestAutoVideoDecoder:
+    """Backend selection and fallback for frame decoding."""
 
-    AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+    def test_auto_decoder_prefers_decord(
+        self, synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+        frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
+        monkeypatch.setattr(
+            video_module, "_decord_decode", lambda *_: calls.append("decord") or frames
+        )
+        monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: calls.append("pyav") or frames)
 
-    assert calls == ["decord"]
-
-
-def test_auto_decoder_falls_back_to_pyav(
-    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    frames = torch.tensor([2, 0, 2], dtype=torch.uint8).view(3, 1, 1, 1).expand(-1, 3, 2, 2)
-    monkeypatch.setattr(video_module, "_decord_decode", _backend_unavailable)
-    monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: frames)
-
-    decoded = AutoVideoDecoder().decode(synthetic_manifest.records[0], (2, 0, 2))
-
-    assert decoded[:, 0, 0, 0].tolist() == [2, 0, 2]
-
-
-def test_auto_decoder_recovers_from_decord_decode_failure(
-    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
-
-    def fail_decord(*_: object) -> torch.Tensor:
-        raise video_module.VideoDecodeError("Decord rejected malformed H.264 packets")
-
-    monkeypatch.setattr(video_module, "_decord_decode", fail_decord)
-    monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: frames)
-
-    assert AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,)) is frames
-
-
-def test_auto_decoder_does_not_mask_programmer_errors(
-    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    error = RuntimeError("unexpected tensor contract bug")
-
-    def fail_unexpectedly(*_: object) -> torch.Tensor:
-        raise error
-
-    monkeypatch.setattr(video_module, "_decord_decode", fail_unexpectedly)
-
-    with pytest.raises(RuntimeError) as caught:
         AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
 
-    assert caught.value is error
+        assert calls == ["decord"]
+
+    def test_auto_decoder_falls_back_to_pyav(
+        self, synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        frames = torch.tensor([2, 0, 2], dtype=torch.uint8).view(3, 1, 1, 1).expand(-1, 3, 2, 2)
+        monkeypatch.setattr(video_module, "_decord_decode", _backend_unavailable)
+        monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: frames)
+
+        decoded = AutoVideoDecoder().decode(synthetic_manifest.records[0], (2, 0, 2))
+
+        assert decoded[:, 0, 0, 0].tolist() == [2, 0, 2]
+
+    def test_auto_decoder_recovers_from_decord_decode_failure(
+        self, synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        frames = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
+
+        def fail_decord(*_: object) -> torch.Tensor:
+            raise video_module.VideoDecodeError("Decord rejected malformed H.264 packets")
+
+        monkeypatch.setattr(video_module, "_decord_decode", fail_decord)
+        monkeypatch.setattr(video_module, "_pyav_decode", lambda *_: frames)
+
+        assert AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,)) is frames
+
+    def test_auto_decoder_does_not_mask_programmer_errors(
+        self, synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        error = RuntimeError("unexpected tensor contract bug")
+
+        def fail_unexpectedly(*_: object) -> torch.Tensor:
+            raise error
+
+        monkeypatch.setattr(video_module, "_decord_decode", fail_unexpectedly)
+
+        with pytest.raises(RuntimeError) as caught:
+            AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+        assert caught.value is error
+
+    def test_auto_decoder_names_both_missing_backends(
+        self, synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(video_module, "_decord_decode", _backend_unavailable)
+        monkeypatch.setattr(video_module, "_pyav_decode", _backend_unavailable)
+
+        with pytest.raises(RuntimeError, match="decord: unavailable; PyAV: unavailable") as caught:
+            AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+
+        assert isinstance(caught.value.__cause__, VideoBackendUnavailable)
 
 
-def test_auto_decoder_names_both_missing_backends(
-    synthetic_manifest: DatasetManifest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(video_module, "_decord_decode", _backend_unavailable)
-    monkeypatch.setattr(video_module, "_pyav_decode", _backend_unavailable)
+class TestVideoProbe:
+    """Metadata probing across decord and PyAV backends."""
 
-    with pytest.raises(RuntimeError, match="decord: unavailable; PyAV: unavailable") as caught:
-        AutoVideoDecoder().decode(synthetic_manifest.records[0], (0,))
+    def test_video_probe_prefers_decord(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        calls: list[str] = []
+        expected = VideoMetadata(frame_count=12, fps=25.0)
+        monkeypatch.setattr(
+            video_module, "_decord_probe", lambda *_: calls.append("decord") or expected
+        )
+        monkeypatch.setattr(
+            video_module, "_pyav_probe", lambda *_: calls.append("pyav") or expected
+        )
 
-    assert isinstance(caught.value.__cause__, VideoBackendUnavailable)
+        assert probe_video(tmp_path / "clip.mp4") == expected
+        assert calls == ["decord"]
 
+    def test_video_probe_falls_back_to_pyav(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        expected = VideoMetadata(frame_count=12, fps=25.0)
+        monkeypatch.setattr(video_module, "_decord_probe", _backend_unavailable)
+        monkeypatch.setattr(video_module, "_pyav_probe", lambda *_: expected)
 
-def test_video_probe_prefers_decord(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    calls: list[str] = []
-    expected = VideoMetadata(frame_count=12, fps=25.0)
-    monkeypatch.setattr(
-        video_module, "_decord_probe", lambda *_: calls.append("decord") or expected
+        assert probe_video(tmp_path / "clip.mp4") == expected
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [VideoMetadata(frame_count=0, fps=25.0), VideoMetadata(frame_count=12, fps=0.0)],
     )
-    monkeypatch.setattr(video_module, "_pyav_probe", lambda *_: calls.append("pyav") or expected)
+    def test_video_probe_rejects_non_positive_metadata(
+        self, metadata: VideoMetadata, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(video_module, "_decord_probe", lambda *_: metadata)
 
-    assert probe_video(tmp_path / "clip.mp4") == expected
-    assert calls == ["decord"]
-
-
-def test_video_probe_falls_back_to_pyav(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    expected = VideoMetadata(frame_count=12, fps=25.0)
-    monkeypatch.setattr(video_module, "_decord_probe", _backend_unavailable)
-    monkeypatch.setattr(video_module, "_pyav_probe", lambda *_: expected)
-
-    assert probe_video(tmp_path / "clip.mp4") == expected
+        with pytest.raises(ValueError, match="positive"):
+            probe_video(tmp_path / "private" / "clip.mp4")
 
 
-@pytest.mark.parametrize(
-    "metadata",
-    [VideoMetadata(frame_count=0, fps=25.0), VideoMetadata(frame_count=12, fps=0.0)],
-)
-def test_video_probe_rejects_non_positive_metadata(
-    metadata: VideoMetadata, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(video_module, "_decord_probe", lambda *_: metadata)
+class TestSafeExtractZip:
+    """Path-traversal-safe zip extraction."""
 
-    with pytest.raises(ValueError, match="positive"):
-        probe_video(tmp_path / "private" / "clip.mp4")
+    @pytest.mark.parametrize(
+        "member", ["../escape.txt", "/absolute.txt", "nested/../../escape.txt"]
+    )
+    def test_safe_extract_zip_rejects_members_outside_destination(
+        self, tmp_path: Path, member: str
+    ) -> None:
+        archive = tmp_path / "archive.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr(member, "unsafe")
 
+        with pytest.raises(ValueError, match="unsafe archive member"):
+            safe_extract_zip(archive, tmp_path / "data")
 
-@pytest.mark.parametrize("member", ["../escape.txt", "/absolute.txt", "nested/../../escape.txt"])
-def test_safe_extract_zip_rejects_members_outside_destination(tmp_path: Path, member: str) -> None:
-    archive = tmp_path / "archive.zip"
-    with zipfile.ZipFile(archive, "w") as handle:
-        handle.writestr(member, "unsafe")
+    def test_safe_extract_zip_preserves_nested_files(self, tmp_path: Path) -> None:
+        archive = tmp_path / "archive.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("sample/video.mp4", "video")
 
-    with pytest.raises(ValueError, match="unsafe archive member"):
-        safe_extract_zip(archive, tmp_path / "data")
+        destination = tmp_path / "data"
+        safe_extract_zip(archive, destination)
 
-
-def test_safe_extract_zip_preserves_nested_files(tmp_path: Path) -> None:
-    archive = tmp_path / "archive.zip"
-    with zipfile.ZipFile(archive, "w") as handle:
-        handle.writestr("sample/video.mp4", "video")
-
-    destination = tmp_path / "data"
-    safe_extract_zip(archive, destination)
-
-    assert (destination / "sample" / "video.mp4").read_text() == "video"
+        assert (destination / "sample" / "video.mp4").read_text() == "video"
 
 
 def test_fvessel_downloader_exposes_named_command(
