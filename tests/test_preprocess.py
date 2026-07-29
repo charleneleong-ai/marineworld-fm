@@ -1,4 +1,4 @@
-"""Tests for decode-friendly proxy transcoding."""
+"""Tests for decode-friendly clip preprocessing."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from marineworld.data.transcode import ProxySpec, build_proxies, transcode_clip
+from marineworld.data.preprocess import PreprocessSpec, build_preprocessed, preprocess_clip
 
 
 def _touch_mp4(path: Path) -> None:
@@ -16,15 +16,17 @@ def _touch_mp4(path: Path) -> None:
     path.write_bytes(b"stub")
 
 
-def _noop_transcode(src: Path, dst: Path, spec: ProxySpec) -> None:
+def _noop_preprocess(src: Path, dst: Path, spec: PreprocessSpec) -> None:
     _touch_mp4(dst)
 
 
-class TestProxyCommand:
-    """The ffmpeg invocation encodes the small-frame, short-GOP proxy contract."""
+class TestPreprocessCommand:
+    """The ffmpeg invocation encodes the small-frame, short-GOP contract."""
 
     def test_command_downscales_pins_gop_and_drops_audio(self, tmp_path: Path) -> None:
-        cmd = ProxySpec(height=256, gop=10).ffmpeg_command(tmp_path / "a.mp4", tmp_path / "b.mp4")
+        cmd = PreprocessSpec(height=256, gop=10).ffmpeg_command(
+            tmp_path / "a.mp4", tmp_path / "b.mp4"
+        )
         assert "scale=-2:256" in cmd
         assert cmd[cmd.index("-g") + 1] == "10"
         assert cmd[cmd.index("-keyint_min") + 1] == "10"
@@ -33,36 +35,36 @@ class TestProxyCommand:
         assert cmd[-1] == str(tmp_path / "b.mp4")
 
 
-class TestBuildProxies:
-    """Walk source clips into a mirrored proxy tree, idempotently."""
+class TestBuildPreprocessed:
+    """Walk source clips into a mirrored output tree, idempotently."""
 
     def test_mirrors_structure_and_skips_existing_on_a_second_run(self, tmp_path: Path) -> None:
-        source_root, proxy_root = tmp_path / "src", tmp_path / "proxy"
+        source_root, out_root = tmp_path / "src", tmp_path / "out"
         clips = [source_root / "Clip-10" / f"clip-{i}" / "v.mp4" for i in (1, 2)]
         for clip in clips:
             _touch_mp4(clip)
 
-        written = build_proxies(source_root, proxy_root, clips, transcode=_noop_transcode)
+        written = build_preprocessed(source_root, out_root, clips, preprocess=_noop_preprocess)
 
-        assert [dst.relative_to(proxy_root) for dst in written] == [
+        assert [dst.relative_to(out_root) for dst in written] == [
             clip.relative_to(source_root) for clip in clips
         ]
-        assert build_proxies(source_root, proxy_root, clips, transcode=_noop_transcode) == []
+        assert build_preprocessed(source_root, out_root, clips, preprocess=_noop_preprocess) == []
 
-    def test_force_retranscodes_existing_proxies(self, tmp_path: Path) -> None:
-        source_root, proxy_root = tmp_path / "src", tmp_path / "proxy"
+    def test_force_reruns_existing_outputs(self, tmp_path: Path) -> None:
+        source_root, out_root = tmp_path / "src", tmp_path / "out"
         clip = source_root / "v.mp4"
         _touch_mp4(clip)
-        _touch_mp4(proxy_root / "v.mp4")
+        _touch_mp4(out_root / "v.mp4")
 
-        assert build_proxies(source_root, proxy_root, [clip], transcode=_noop_transcode) == []
-        forced = build_proxies(
-            source_root, proxy_root, [clip], transcode=_noop_transcode, force=True
+        assert build_preprocessed(source_root, out_root, [clip], preprocess=_noop_preprocess) == []
+        forced = build_preprocessed(
+            source_root, out_root, [clip], preprocess=_noop_preprocess, force=True
         )
-        assert forced == [proxy_root / "v.mp4"]
+        assert forced == [out_root / "v.mp4"]
 
 
-def test_transcode_clip_raises_and_removes_partial_output_on_failure(
+def test_preprocess_clip_raises_and_removes_partial_output_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dst = tmp_path / "out" / "b.mp4"
@@ -75,13 +77,13 @@ def test_transcode_clip_raises_and_removes_partial_output_on_failure(
     monkeypatch.setattr(subprocess, "run", failing_run)
 
     with pytest.raises(RuntimeError, match="ffmpeg failed"):
-        transcode_clip(tmp_path / "a.mp4", dst, ProxySpec())
-    assert not dst.exists()  # no proxy at the final path
+        preprocess_clip(tmp_path / "a.mp4", dst, PreprocessSpec())
+    assert not dst.exists()  # no output at the final path
     assert not dst.with_suffix(f".tmp{dst.suffix}").exists()  # temp cleaned up too
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg binary not installed")
-def test_transcode_produces_a_downscaled_short_gop_proxy(tmp_path: Path) -> None:
+def test_preprocess_produces_a_downscaled_short_gop_clip(tmp_path: Path) -> None:
     import av
 
     src = tmp_path / "src.mp4"
@@ -102,9 +104,9 @@ def test_transcode_produces_a_downscaled_short_gop_proxy(tmp_path: Path) -> None
         ],
         check=True,
     )
-    dst = tmp_path / "proxy.mp4"
+    dst = tmp_path / "out.mp4"
 
-    transcode_clip(src, dst, ProxySpec(height=64, gop=5))
+    preprocess_clip(src, dst, PreprocessSpec(height=64, gop=5))
 
     with av.open(str(dst)) as container:
         stream = container.streams.video[0]
