@@ -527,12 +527,18 @@ def build_module(cfg: DictConfig) -> VideoMAEPretrainingModule:
     epochs = int(cfg.train.epochs)
     if not 0 <= warmup_epochs <= epochs:
         raise ValueError(f"warmup_epochs must be between 0 and epochs ({epochs})")
+    # A bounded run (max_steps > 0) already knows its horizon, so pass it as the
+    # schedule budget. Reading it from trainer.estimated_stepping_batches instead
+    # makes Lightning iterate the whole train dataloader before the first step --
+    # a full decode pass of the corpus that dominates wall time on damaged video.
+    max_steps = int(cfg.runtime.max_steps)
     return VideoMAEPretrainingModule(
         model_config,
         lr=float(cfg.train.lr),
         weight_decay=float(cfg.train.weight_decay),
         warmup_epochs=warmup_epochs,
         max_epochs=epochs,
+        total_steps=max_steps if max_steps > 0 else None,
         seed=int(cfg.seed),
     )
 
