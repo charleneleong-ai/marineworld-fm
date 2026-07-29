@@ -55,6 +55,10 @@ depends = ["lint", "format:check", "test"]
 description = "Download and safely extract the official 2.56 GB FVessel Clip-10 subset."
 run = "uv run python -m marineworld.data.download fvessel-clip10 --output data/raw/fvessel"
 
+[tasks."proxy:fvessel"]
+description = "Transcode the 2K long-GOP FVessel clips into 256p short-GOP proxies for fast random-access training."
+run = "uv run python -m marineworld.data.transcode fvessel data/raw/fvessel data/proxy/fvessel"
+
 # --- Pretraining -------------------------------------------------------------
 # Real-data tasks require MARINEWORLD_DATA_ROOT so a restricted corpus path is
 # never baked into a committed config.
