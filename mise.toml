@@ -78,11 +78,11 @@ WANDB_MODE=offline uv run python -m marineworld.train.pretrain \
 """
 
 [tasks."smoke:fvessel"]
-description = "Bounded real FVessel decode/train smoke with online tracking."
+description = "Bounded real FVessel smoke on the 256p preprocessed clips (run preprocess:fvessel first)."
 run = """
-test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT to the preprocessed clips (mise run preprocess:fvessel)" >&2; exit 1; }
 WANDB_MODE=online uv run python -m marineworld.train.pretrain \
-  data=fvessel model=videomae_vit_small runtime=real_smoke \
+  data=fvessel_preprocessed model=videomae_vit_small runtime=real_smoke \
   data.root="$MARINEWORLD_DATA_ROOT"
 """
 
