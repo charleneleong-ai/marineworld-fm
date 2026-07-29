@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import zipfile
 from collections.abc import Sequence
@@ -19,6 +20,7 @@ from typer.testing import CliRunner
 from marineworld.data import download as download_module
 from marineworld.data import video as video_module
 from marineworld.data.adapters import (
+    QUARANTINE_NAME,
     CompositeAdapter,
     DatasetAdapter,
     FrameCountCache,
@@ -78,8 +80,8 @@ def _never_probe(_: Path) -> float:
     raise AssertionError("explicit FPS must bypass probing")
 
 
-def _fps_nan(_: Path) -> float:
-    return float("nan")
+def _fps_nan_for_bad(path: Path) -> float:
+    return float("nan") if "bad" in path.stem else 25.0
 
 
 def _backend_unavailable(*_args: object) -> NoReturn:
@@ -88,6 +90,21 @@ def _backend_unavailable(*_args: object) -> NoReturn:
 
 def _frames_96(_: Path) -> int:
     return 96
+
+
+def _frames_reject_undecodable(path: Path) -> int:
+    if "bad" in path.stem:
+        raise RuntimeError("clip is undecodable")
+    return 16
+
+
+def _fvessel_root_with_clips(tmp_path: Path, *names: str) -> Path:
+    root = tmp_path / "fvessel"
+    for name in names:
+        sample = root / f"sample-{name}"
+        (sample / "ais").mkdir(parents=True)
+        (sample / f"{name}.mp4").touch()
+    return root
 
 
 def _target(frame_index: int) -> FrameTargets:
@@ -522,12 +539,29 @@ def test_fvessel_explicit_fps_bypasses_probe(tmp_path: Path) -> None:
     assert record.fps == 20.0
 
 
-def test_fvessel_rejects_invalid_probed_fps(tmp_path: Path) -> None:
-    _, root = _fvessel_adapter(tmp_path)
-    adapter = FVesselAdapter(version="fixture", fps=None, num_frames=16, fps_probe=_fps_nan)
+@pytest.mark.parametrize(
+    ("adapter_kwargs", "reason_substring"),
+    [
+        (
+            {"fps": 30.0, "num_frames": None, "frame_count_probe": _frames_reject_undecodable},
+            "undecodable",
+        ),
+        ({"fps": None, "num_frames": 16, "fps_probe": _fps_nan_for_bad}, "FPS must be positive"),
+    ],
+    ids=["undecodable-frames", "uninterpretable-fps"],
+)
+def test_fvessel_quarantines_a_bad_clip_and_records_its_reason(
+    tmp_path: Path, adapter_kwargs: dict[str, object], reason_substring: str
+) -> None:
+    root = _fvessel_root_with_clips(tmp_path, "good", "bad")
+    adapter = FVesselAdapter(version="fixture", **adapter_kwargs)
 
-    with pytest.raises(ValueError, match="FPS must be positive"):
-        adapter.build_manifest(root)
+    manifest = adapter.build_manifest(root)
+
+    assert [record.video_path.name for record in manifest.records] == ["good.mp4"]
+    quarantine = json.loads((root / QUARANTINE_NAME).read_text())
+    assert list(quarantine) == ["sample-bad/bad.mp4"]
+    assert reason_substring in quarantine["sample-bad/bad.mp4"]
 
 
 @pytest.mark.parametrize("dataset", ["fvessel", "smd"])
@@ -551,6 +585,25 @@ def test_real_adapters_probe_source_frame_counts(dataset: str, tmp_path: Path) -
     record = adapter.build_manifest(root).records[0]
 
     assert record.num_frames == 96
+
+
+def test_fvessel_excludes_gt_overlay_videos(tmp_path: Path) -> None:
+    _, root = _fvessel_adapter(tmp_path)
+    (root / "sample-01" / "gt" / "overlay.mp4").touch()  # a MOT overlay, not a capture clip
+
+    manifest = FVesselAdapter(version="fixture", fps=30.0, num_frames=16).build_manifest(root)
+
+    assert [record.video_path.name for record in manifest.records] == ["sample.mp4"]
+
+
+def test_fvessel_rejects_a_fully_undecodable_corpus(tmp_path: Path) -> None:
+    root = _fvessel_root_with_clips(tmp_path, "bad")
+    adapter = FVesselAdapter(
+        version="fixture", fps=30.0, num_frames=None, frame_count_probe=_frames_reject_undecodable
+    )
+
+    with pytest.raises(ValueError, match="failed to decode"):
+        adapter.build_manifest(root)
 
 
 def test_build_adapter_instantiates_configured_target() -> None:

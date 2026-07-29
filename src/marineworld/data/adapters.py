@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
@@ -14,6 +15,77 @@ from marineworld.data.contracts import DatasetManifest, FrameTargets, VideoRecor
 from marineworld.data.manifest import manifest_checksum
 
 FRAME_COUNT_CACHE_NAME = ".marineworld_frame_counts.json"
+QUARANTINE_NAME = ".marineworld_quarantine.json"
+
+logger = logging.getLogger(__name__)
+
+
+def write_sidecar_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Best-effort write of a JSON file beside the data; never fail a build on it.
+
+    Frame counts and quarantine records are aids that live next to the corpus and
+    are safe to delete; a read-only data directory degrades to not persisting them
+    rather than raising.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    except OSError:
+        pass
+
+
+def collect_records(
+    clips: Iterable[Path],
+    record: Callable[[Path], VideoRecord],
+    root: Path,
+    dataset: str,
+) -> tuple[VideoRecord, ...]:
+    """Build records from clips, quarantining any that cannot be probed or decoded.
+
+    A clip whose probe/decode fails is set aside -- recorded in a JSON sidecar and
+    logged -- rather than failing the whole build: the corpus is otherwise usable,
+    and a dead clip that never enters the manifest cannot hang a dataloader later.
+    An all-undecodable corpus still raises, since an empty manifest is a broken one.
+    """
+    records: list[VideoRecord] = []
+    quarantine: dict[str, str] = {}
+    for clip in clips:
+        try:
+            records.append(record(clip))
+        except (ValueError, RuntimeError) as error:
+            # TODO: narrow to a dedicated UndecodableClip sentinel raised at the
+            # probe/decode boundary, so a genuine config or record-invariant bug is
+            # not masked as a bad clip. Acceptable at v0: uniform per-clip config
+            # means a real bug fails every clip and trips the empty guard below.
+            quarantine[clip.relative_to(root).as_posix()] = str(error)
+    report_quarantine(root, quarantine, dataset)
+    if quarantine and not records:
+        # A corpus that had clips but decoded none is broken in a specific way worth
+        # naming here; an empty corpus (no clips at all) is left to the downstream
+        # manifest validation, which owns the generic "no records" invariant.
+        raise ValueError(
+            f"every {dataset} clip under {root} failed to decode "
+            f"(quarantined {len(quarantine)}); see {root / QUARANTINE_NAME}"
+        )
+    return tuple(records)
+
+
+def report_quarantine(root: Path, quarantine: Mapping[str, str], dataset: str) -> None:
+    """Warn about and persist clips dropped from a manifest as undecodable."""
+    path = root / QUARANTINE_NAME
+    if not quarantine:
+        try:
+            path.unlink(missing_ok=True)  # keep a stale audit from misleading a later build
+        except OSError:
+            pass
+        return
+    logger.warning(
+        "%s quarantined %d undecodable clip(s), excluded from the manifest: %s",
+        dataset,
+        len(quarantine),
+        ", ".join(sorted(quarantine)),
+    )
+    write_sidecar_json(path, quarantine)
 
 
 @dataclass
@@ -53,11 +125,7 @@ class FrameCountCache:
             return cached[2]
         count = probe(video)
         self.entries[key] = [stat.st_size, stat.st_mtime_ns, count]
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self.entries, indent=2, sort_keys=True))
-        except OSError:
-            pass  # the cache is an optimisation; never let it break a build
+        write_sidecar_json(self.path, self.entries)
         return count
 
 

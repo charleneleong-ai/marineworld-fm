@@ -23,7 +23,12 @@ from typing import Callable
 
 import numpy as np
 
-from marineworld.data.adapters import FrameCountCache, resolve_fps, resolve_frame_count
+from marineworld.data.adapters import (
+    FrameCountCache,
+    collect_records,
+    resolve_fps,
+    resolve_frame_count,
+)
 from marineworld.data.alignment import (
     AISRecord,
     align_tracks_to_frames,
@@ -48,7 +53,12 @@ class FVesselAdapter:
 
     def build_manifest(self, root: Path) -> DatasetManifest:
         cache = FrameCountCache.for_root(root)
-        records = tuple(self._record(root, video, cache) for video in sorted(root.rglob("*.mp4")))
+        records = collect_records(
+            self.source_clips(root),
+            lambda video: self._record(root, video, cache),
+            root,
+            "fvessel",
+        )
         return DatasetManifest(
             "fvessel",
             self.version,
@@ -57,6 +67,13 @@ class FVesselAdapter:
             access="public",
             label_mapping={"1": "vessel"},
             native_labels=("MOT class_id", "AIS MMSI"),
+        )
+
+    @staticmethod
+    def source_clips(root: Path) -> list[Path]:
+        """Capture clips only, excluding the MOT ground-truth overlays under gt/."""
+        return sorted(
+            video for video in root.rglob("*.mp4") if "gt" not in video.relative_to(root).parts
         )
 
     def load_targets(self, record: VideoRecord) -> tuple[FrameTargets, ...]:
