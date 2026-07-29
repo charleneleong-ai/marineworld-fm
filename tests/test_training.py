@@ -1818,6 +1818,18 @@ class TestPretrainingModule:
         with pytest.raises(ValueError, match="warmup_epochs"):
             build_module(cfg)
 
+    def test_bounded_run_takes_its_step_budget_from_max_steps(self, tmp_path: Path) -> None:
+        # A fixed max_steps must reach the scheduler as total_steps so it never
+        # reads trainer.estimated_stepping_batches, which would iterate the whole
+        # train dataloader (a full decode pass) before the first step.
+        module = build_module(_smoke_config(tmp_path, max_steps=300))
+        assert module.total_steps == 300
+        assert module.configure_optimizers()["lr_scheduler"]["scheduler"] is not None
+
+    def test_unbounded_run_defers_the_step_budget_to_the_trainer(self, tmp_path: Path) -> None:
+        module = build_module(_smoke_config(tmp_path, max_steps=-1))
+        assert module.total_steps is None
+
 
 class TestScheduler:
     """Warmup-cosine LR schedule shape and step budget."""
