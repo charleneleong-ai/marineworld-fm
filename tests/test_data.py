@@ -622,6 +622,7 @@ def test_build_adapter_instantiates_configured_target() -> None:
     ("config_name", "adapter_type"),
     [
         ("fvessel", FVesselAdapter),
+        ("fvessel_proxy", FVesselAdapter),
         ("smd", SMDAdapter),
         ("synthetic", SyntheticAdapter),
     ],
@@ -633,6 +634,18 @@ def test_data_config_constructs_its_adapter(
     config = yaml.safe_load(config_path.read_text())
 
     assert isinstance(build_adapter(config["adapter"]), adapter_type)
+
+
+def test_fvessel_proxy_config_is_fvessel_pointed_at_the_proxy_root() -> None:
+    configs = Path(__file__).parents[1] / "configs" / "data"
+    base = yaml.safe_load((configs / "fvessel.yaml").read_text())
+    proxy = yaml.safe_load((configs / "fvessel_proxy.yaml").read_text())
+
+    assert proxy["root"] == "data/proxy/fvessel"
+    # the proxy corpus must otherwise match fvessel, or the two silently drift
+    assert {k: v for k, v in proxy.items() if k != "root"} == {
+        k: v for k, v in base.items() if k != "root"
+    }
 
 
 def test_fvessel_data_config_passes_fps_to_adapter() -> None:
