@@ -7,7 +7,7 @@ name = "marineworld-fm"
 version = "0.0.1"
 description = "Self-supervised multimodal temporal foundation model for maritime perception"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = { text = "MIT" }
 
 # Deps are grouped: core (always needed for data/alignment utils) and

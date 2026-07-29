@@ -49,8 +49,8 @@ marineworld-fm/
 
 ## Quick start
 
-The developer toolchain defaults to Python 3.13.7; package metadata retains Python
-3.11+ compatibility. Dependencies are locked in `uv.lock`.
+The project requires Python 3.13+ (toolchain pinned to 3.13.7). Dependencies are
+locked in `uv.lock`.
 
 ```bash
 # Install the locked environment (core + train + dev) via mise + uv.
