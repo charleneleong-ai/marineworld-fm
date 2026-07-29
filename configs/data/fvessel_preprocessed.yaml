@@ -1,0 +1,28 @@
+# FVessel on the decode-friendly 256p short-GOP clips (`mise run preprocess:fvessel`).
+# Identical to `fvessel` except `root`; the 2K source is slow to random-seek, so
+# training reads the preprocessed clips. Kept in sync with fvessel.yaml (enforced by a test).
+name: fvessel
+root: data/preprocessed/fvessel
+num_frames: null
+image_size: 224
+adapter:
+  _target_: marineworld.data.fvessel.FVesselAdapter
+  version: v1
+  fps: null            # null probes source FPS; a positive value overrides it
+  num_frames: null       # null probes each video's real frame count
+
+# AIS<->frame temporal alignment (see marineworld.data.alignment).
+ais:
+  method: linear       # "linear" or "nearest"
+  tolerance_ms: 500    # max |frame_t - sample_t| for nearest / endpoint clamp
+  max_gap_ms: null     # null => 4 * tolerance_ms; larger gaps are dropouts
+
+split:
+  val_frac: 0.15
+  test_frac: 0.15
+transforms:
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  train:
+    color_jitter: 0.1
