@@ -6,6 +6,7 @@ PYTHONDONTWRITEBYTECODE = "1"
 
 [tools]
 python = "3.13.7"
+uv = "0.11.29"
 
 [tasks.setup]
 description = "Install the locked environment (core + train + dev)."
