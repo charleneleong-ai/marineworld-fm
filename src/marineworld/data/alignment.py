@@ -248,6 +248,14 @@ def load_ais_tracks(path: str | Path) -> dict[int, AISTrack]:
 
     missing = set(_AIS_COLUMNS) - set(df.columns)
     if missing:
+        # Try case-insensitive rename (FVessel CSVs use lowercase).
+        col_map = {c.lower(): c for c in _AIS_COLUMNS if c != "Number"}
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        # Synthesize "Number" as row index if absent.
+        if "Number" not in df.columns:
+            df["Number"] = range(len(df))
+        missing = set(_AIS_COLUMNS) - set(df.columns)
+    if missing:
         raise ValueError(f"AIS data missing columns: {sorted(missing)}")
 
     tracks: dict[int, AISTrack] = {}
