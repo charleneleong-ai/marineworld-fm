@@ -270,8 +270,12 @@ def build_trainer(
     *,
     logger: Logger | bool = False,
     callbacks: list[Callback] | None = None,
+    num_train_batches: int | None = None,
 ) -> Trainer:
     """Construct a Lightning trainer from a composed runtime profile."""
+    limit = cfg.runtime.limit_train_batches
+    if num_train_batches is not None and limit >= 1:
+        limit = num_train_batches
     return Trainer(
         accelerator=str(cfg.runtime.accelerator),
         devices=int(cfg.runtime.devices),
@@ -368,7 +372,12 @@ def _run_with_identity(
         callbacks: list[Callback] = [checkpoint, media]
         if isinstance(sampler, BalancedDatasetSampler):
             callbacks.append(BalancedSamplerCheckpoint(sampler, int(cfg.runtime.batch_size)))
-        trainer = build_trainer(cfg, logger=logger, callbacks=callbacks)
+        trainer = build_trainer(
+            cfg,
+            logger=logger,
+            callbacks=callbacks,
+            num_train_batches=len(train_loader.dataset),
+        )
         module = build_module(cfg)
         trainer.fit(
             module,
@@ -622,7 +631,12 @@ def run_maritime_pretraining(cfg: DictConfig) -> Path:
         callbacks: list[Callback] = [checkpoint, media]
         if isinstance(sampler, BalancedDatasetSampler):
             callbacks.append(BalancedSamplerCheckpoint(sampler, int(cfg.runtime.batch_size)))
-        trainer = build_trainer(cfg, logger=logger, callbacks=callbacks)
+        trainer = build_trainer(
+            cfg,
+            logger=logger,
+            callbacks=callbacks,
+            num_train_batches=len(train_loader.dataset),
+        )
         module = build_maritime_module(cfg)
         trainer.fit(
             module,
