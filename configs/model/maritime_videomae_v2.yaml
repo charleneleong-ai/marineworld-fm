@@ -1,0 +1,19 @@
+# Maritime VideoMAE ViT-small for v2 cross-modal (video + AIS) pretraining.
+name: maritime_videomae_v2
+backbone: vit_small
+patch_size: 16
+tubelet_size: 2
+num_frames: 16
+image_size: 224
+hidden_size: 384
+num_hidden_layers: 12
+num_attention_heads: 6
+intermediate_size: 1536
+mask_ratio: 0.9
+decoder_hidden_size: 192
+decoder_num_hidden_layers: 4
+decoder_num_attention_heads: 3
+decoder_intermediate_size: 768
+num_vessel_types: 100
+num_cross_attn_layers: 2
+cross_attn_heads: 2

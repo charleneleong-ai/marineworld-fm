@@ -1337,7 +1337,14 @@ class TestTrainingManifest:
         dataloaders = build_dataloaders(cfg, manifest)
         batch = next(iter(dataloaders["train_dataloaders"]))
 
-        assert batch.keys() == {"pixel_values", "dataset", "record_id", "source"}
+        assert batch.keys() == {
+            "pixel_values",
+            "dataset",
+            "record_id",
+            "source",
+            "ais_features",
+            "ais_mask",
+        }
         assert batch["pixel_values"].shape == (1, 4, 3, 16, 16)
 
     def test_default_fvessel_manifest_is_split_by_video_without_overlap(

@@ -209,6 +209,8 @@ def build_dataloaders(
 ) -> dict[str, DataLoader[dict[str, Any]]]:
     """Build train and validation loaders over the shared clip contract."""
     decoder = build_decoder(cfg)
+    ais_config = cfg.data.get("ais")
+    max_vessels = int(ais_config.get("max_vessels", 10)) if ais_config else 10
     common = {
         "manifest": manifest,
         "fingerprint": manifest_checksum(manifest),
@@ -219,6 +221,8 @@ def build_dataloaders(
         "seed": int(cfg.seed),
         "normalization_mean": tuple(cfg.data.transforms.normalization.mean),
         "normalization_std": tuple(cfg.data.transforms.normalization.std),
+        "ais_config": dict(ais_config) if ais_config else None,
+        "max_vessels": max_vessels,
     }
     loader = {
         "batch_size": int(cfg.runtime.batch_size),
@@ -504,12 +508,29 @@ def prepare_training_manifest(cfg: DictConfig, manifest: DatasetManifest) -> Dat
 def _pretraining_collate(samples: list[dict[str, Any] | None]) -> dict[str, Any]:
     """Stack only model inputs; annotations are not part of SSL pretraining."""
     samples = drop_undecodable(samples)
-    return {
+    batch: dict[str, Any] = {
         "pixel_values": torch.stack([sample["pixel_values"] for sample in samples]),
         "dataset": tuple(sample["dataset"] for sample in samples),
         "record_id": tuple(sample["record_id"] for sample in samples),
         "source": tuple(sample["source"] for sample in samples),
     }
+    if "ais_features" in samples[0]:
+        batch["ais_features"] = _pad_and_stack([s["ais_features"] for s in samples], pad_value=0.0)
+        batch["ais_mask"] = _pad_and_stack([s["ais_mask"] for s in samples], pad_value=False)
+    return batch
+
+
+def _pad_and_stack(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.Tensor:
+    """Pad tensors along dim=1 (frames/vessels) and stack."""
+    max_len = max(t.shape[1] for t in tensors)
+    padded = []
+    for t in tensors:
+        if t.shape[1] < max_len:
+            pad_shape = list(t.shape)
+            pad_shape[1] = max_len - t.shape[1]
+            t = torch.cat([t, t.new_full(pad_shape, pad_value)], dim=1)
+        padded.append(t)
+    return torch.stack(padded)
 
 
 def build_decoder(cfg: DictConfig) -> VideoDecoder:
@@ -541,6 +562,86 @@ def build_module(cfg: DictConfig) -> VideoMAEPretrainingModule:
         total_steps=max_steps if max_steps > 0 else None,
         seed=int(cfg.seed),
     )
+
+
+def build_maritime_module(cfg: DictConfig) -> Any:
+    from marineworld.train.module import MaritimePretrainingModule
+
+    model_config = OmegaConf.to_container(cfg.model, resolve=True, throw_on_missing=True)
+    if not isinstance(model_config, dict):
+        raise TypeError("model config must resolve to a mapping")
+    warmup_epochs = int(cfg.train.warmup_epochs)
+    epochs = int(cfg.train.epochs)
+    if not 0 <= warmup_epochs <= epochs:
+        raise ValueError(f"warmup_epochs must be between 0 and epochs ({epochs})")
+    max_steps = int(cfg.runtime.max_steps)
+    return MaritimePretrainingModule(
+        model_config,
+        ais_loss_weight=float(model_config.get("ais_loss_weight", 0.5)),
+        lr=float(cfg.train.lr),
+        weight_decay=float(cfg.train.weight_decay),
+        warmup_epochs=warmup_epochs,
+        max_epochs=epochs,
+        total_steps=max_steps if max_steps > 0 else None,
+        seed=int(cfg.seed),
+    )
+
+
+def run_maritime_pretraining(cfg: DictConfig) -> Path:
+    """Train Video + AIS cross-modal pretraining from a composed config."""
+    validate_media_config(cfg)
+    seed_everything(int(cfg.seed))
+    adapter = build_data_adapter(cfg.data)
+    manifest = prepare_training_manifest(cfg, adapter.build_manifest(Path(cfg.data.root)))
+    dataloaders = build_dataloaders(cfg, manifest)
+    checkpoint_provenance = _checkpoint_provenance(cfg.runtime.ckpt_path)
+    resolved = resolved_config(cfg)
+    identity = training_run_identity(cfg, manifest, checkpoint_provenance, resolved)
+    logger = build_wandb_logger(cfg, identity, resolved)
+    checkpoint = ExceptionSafeModelCheckpoint(
+        dirpath=Path(cfg.output_dir) / "checkpoints",
+        monitor=metric_name("val", "loss"),
+        mode="min",
+        save_last=True,
+        save_top_k=1,
+        save_on_exception=True,
+    )
+    try:
+        manifest_path = write_training_manifest(manifest, Path(cfg.output_dir) / "artifacts")
+        _log_training_manifest(manifest_path, identity.run_id, logger)
+        train_loader = dataloaders["train_dataloaders"]
+        sampler = train_loader.sampler
+        media = WandbMediaCallback(
+            mean=tuple(cfg.data.transforms.normalization.mean),
+            std=tuple(cfg.data.transforms.normalization.std),
+            enabled=cfg.tracking.log_media,
+            every_n_epochs=int(cfg.tracking.media_log_every_n_epochs),
+            max_frames=int(cfg.tracking.media_max_frames),
+            checkpoint_callback=checkpoint,
+        )
+        callbacks: list[Callback] = [checkpoint, media]
+        if isinstance(sampler, BalancedDatasetSampler):
+            callbacks.append(BalancedSamplerCheckpoint(sampler, int(cfg.runtime.batch_size)))
+        trainer = build_trainer(cfg, logger=logger, callbacks=callbacks)
+        module = build_maritime_module(cfg)
+        trainer.fit(
+            module,
+            **dataloaders,
+            ckpt_path=cfg.runtime.ckpt_path,
+        )
+        if not checkpoint.last_model_path:
+            raise RuntimeError("training completed without a last checkpoint path")
+        last_checkpoint = Path(checkpoint.last_model_path)
+        if not last_checkpoint.is_file():
+            raise RuntimeError(f"last checkpoint does not exist: {last_checkpoint}")
+    except BaseException as primary_error:
+        try:
+            _finish_wandb(logger, exit_code=1)
+        except BaseException as cleanup_error:
+            primary_error.add_note(f"W&B cleanup also failed: {cleanup_error}")
+        raise
+    _finish_wandb(logger, exit_code=0)
+    return last_checkpoint
 
 
 def _finish_wandb(logger: Logger | bool, *, exit_code: int) -> None:
