@@ -6,6 +6,7 @@ import hashlib
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import numpy as np
@@ -190,6 +191,8 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         normalization_std: tuple[float, float, float] | None = None,
         color_jitter: float = 0.0,
         fingerprint: str | None = None,
+        ais_config: dict[str, Any] | None = None,
+        max_vessels: int = 10,
     ) -> None:
         if image_size is not None and image_size <= 0:
             raise ValueError("image_size must be positive")
@@ -212,6 +215,8 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         self._warned_records: set[str] = set()
         self._targets_by_record: dict[str, tuple[FrameTargets, ...]] = {}
         self._validated_target_records: set[str] = set()
+        self.ais_config = ais_config
+        self.max_vessels = max_vessels
 
     def __len__(self) -> int:
         return len(self.clips)
@@ -235,7 +240,7 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
             )
         transform = self.spatial_transform(frames)
         targets = self.targets_for(record, clip.frame_indices, source_size=frames.shape[-2:])
-        return {
+        sample: dict[str, Any] = {
             "pixel_values": self.transform(
                 frames, sample_index=index, augmentation_seed=augmentation_seed
             ),
@@ -247,6 +252,46 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
             "is_labelled": record.dataset == "synthetic" or record.annotation_path is not None,
             "spatial_transform": transform,
         }
+        if self.ais_config and record.metadata.get("has_ais"):
+            sample.update(self._load_ais(record, clip))
+        else:
+            num_frames = len(clip.frame_indices)
+            sample["ais_features"] = torch.zeros(num_frames, self.max_vessels, 7)
+            sample["ais_mask"] = torch.zeros(num_frames, self.max_vessels, dtype=torch.bool)
+        return sample
+
+    def _load_ais(self, record: VideoRecord, clip: ClipIndex) -> dict[str, torch.Tensor]:
+        """Load and align AIS features for a clip."""
+        from marineworld.data.ais_encoder import ais_features_from_records
+        from marineworld.data.alignment import (
+            align_tracks_to_frames,
+            frame_timestamps_ms,
+            load_ais_tracks,
+        )
+
+        ais_dir = Path(record.metadata["ais_dir"])
+        num_frames = len(clip.frame_indices)
+        fps = record.fps
+
+        # Derive start_ms from AIS data: use earliest track timestamp.
+        tracks = load_ais_tracks(ais_dir)
+        if tracks:
+            all_ts = []
+            for track in tracks.values():
+                all_ts.extend(track.timestamps_ms.tolist())
+            start_ms = min(all_ts) if all_ts else 0.0
+        else:
+            start_ms = 0.0
+
+        frame_ts = frame_timestamps_ms(start_ms, num_frames, fps)
+        method = self.ais_config.get("method", "linear")
+        tolerance_ms = self.ais_config.get("tolerance_ms", 500.0)
+        max_gap_ms = self.ais_config.get("max_gap_ms", None)
+        aligned = align_tracks_to_frames(
+            tracks, frame_ts, method=method, tolerance_ms=tolerance_ms, max_gap_ms=max_gap_ms
+        )
+        features, mask = ais_features_from_records(aligned, max_vessels=self.max_vessels)
+        return {"ais_features": features, "ais_mask": mask}
 
     def _record_decode_failure(self, clip: ClipIndex, reason: str) -> None:
         self.decode_failures.append(

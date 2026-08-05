@@ -127,6 +127,7 @@ class FVesselAdapter:
 
     def _record(self, root: Path, video: Path, cache: FrameCountCache) -> VideoRecord:
         annotation = FVesselAdapter.mot_path(video.parent)
+        ais_dir = video.parent / "ais"
         return VideoRecord(
             id=video.relative_to(root).with_suffix("").as_posix(),
             dataset="fvessel",
@@ -138,7 +139,10 @@ class FVesselAdapter:
                 self.num_frames, video, self.frame_count_probe, "FVessel", cache
             ),
             annotation_path=annotation,
-            metadata={"has_ais": (video.parent / "ais").is_dir()},
+            metadata={
+                "has_ais": ais_dir.is_dir(),
+                "ais_dir": str(ais_dir) if ais_dir.is_dir() else None,
+            },
         )
 
     @staticmethod

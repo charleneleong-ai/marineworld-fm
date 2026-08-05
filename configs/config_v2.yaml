@@ -1,0 +1,11 @@
+# MarineWorld-FM v2: Video + AIS cross-modal pretraining.
+defaults:
+  - data: fvessel
+  - model: maritime_videomae_v2
+  - train: pretrain
+  - runtime: a100
+  - tracking: wandb
+  - _self_
+
+seed: 42
+output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
