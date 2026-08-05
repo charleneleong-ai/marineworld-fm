@@ -111,6 +111,14 @@ WANDB_MODE=online uv run python -m marineworld.train.pretrain \
   data=joint runtime=a100 data.root="$MARINEWORLD_DATA_ROOT"
 """
 
+[tasks."train:v2"]
+description = "v2 cross-modal pretraining (video + AIS encoder)."
+run = """
+test -n "$MARINEWORLD_DATA_ROOT" || { echo "set MARINEWORLD_DATA_ROOT" >&2; exit 1; }
+WANDB_MODE=online uv run python -m marineworld.train.pretrain \
+  --config-name=config_v2 runtime=a100 data.root="$MARINEWORLD_DATA_ROOT"
+"""
+
 # --- Representation evaluation ------------------------------------------------
 
 [tasks."eval:probes"]
