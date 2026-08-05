@@ -217,6 +217,23 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         self._validated_target_records: set[str] = set()
         self.ais_config = ais_config
         self.max_vessels = max_vessels
+        self._ais_cache: dict[str, dict[int, Any]] = {}
+        if ais_config:
+            self._init_ais_cache(manifest, split)
+
+    def _init_ais_cache(self, manifest: DatasetManifest, split: Split) -> None:
+        """Pre-load AIS tracks into memory so __getitem__ avoids repeated CSV reads."""
+        from marineworld.data.alignment import load_ais_tracks
+
+        for record in manifest.records:
+            if record.split != split:
+                continue
+            ais_dir = record.metadata.get("ais_dir")
+            if not ais_dir:
+                continue
+            path = Path(ais_dir)
+            if path.is_dir() and any(path.glob("*.csv")):
+                self._ais_cache[record.id] = load_ais_tracks(path)
 
     def __len__(self) -> int:
         return len(self.clips)
@@ -265,16 +282,13 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
         from marineworld.data.alignment import (
             align_tracks_to_frames,
             frame_timestamps_ms,
-            load_ais_tracks,
         )
         from marineworld.models.ais_encoder import ais_features_from_records
 
-        ais_dir = Path(record.metadata["ais_dir"])
         num_frames = len(clip.frame_indices)
         fps = record.fps
 
-        # Derive start_ms from AIS data: use earliest track timestamp.
-        tracks = load_ais_tracks(ais_dir)
+        tracks = self._ais_cache.get(record.id, {})
         if tracks:
             all_ts = []
             for track in tracks.values():
