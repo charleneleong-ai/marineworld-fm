@@ -262,12 +262,12 @@ class MaritimeClipDataset(Dataset[dict[str, Any]]):
 
     def _load_ais(self, record: VideoRecord, clip: ClipIndex) -> dict[str, torch.Tensor]:
         """Load and align AIS features for a clip."""
-        from marineworld.data.ais_encoder import ais_features_from_records
         from marineworld.data.alignment import (
             align_tracks_to_frames,
             frame_timestamps_ms,
             load_ais_tracks,
         )
+        from marineworld.models.ais_encoder import ais_features_from_records
 
         ais_dir = Path(record.metadata["ais_dir"])
         num_frames = len(clip.frame_indices)
