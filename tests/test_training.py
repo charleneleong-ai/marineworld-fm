@@ -1473,7 +1473,7 @@ class TestPretrainingRun:
         message: str,
     ) -> None:
         def _trainer_factory(
-            _cfg: DictConfig, *, logger: object, callbacks: list[object]
+            _cfg: DictConfig, *, logger: object, callbacks: list[object], **_kwargs: object
         ) -> CheckpointPathTrainer:
             del logger
             return CheckpointPathTrainer(callbacks[0], last_path)
@@ -1504,7 +1504,7 @@ class TestPretrainingRun:
             return SimpleNamespace(experiment=SimpleNamespace(finish=_finish))
 
         def _trainer_factory(
-            _cfg: DictConfig, *, logger: object, callbacks: list[object]
+            _cfg: DictConfig, *, logger: object, callbacks: list[object], **_kwargs: object
         ) -> FakeTrainer:
             del logger
             return FakeTrainer(callbacks[0], fail=next(failures))
@@ -1532,7 +1532,7 @@ class TestPretrainingRun:
         )
 
         def _trainer_factory(
-            _cfg: DictConfig, *, logger: object, callbacks: list[object]
+            _cfg: DictConfig, *, logger: object, callbacks: list[object], **_kwargs: object
         ) -> FakeTrainer:
             del logger
             return FakeTrainer(callbacks[0], fail=True)
