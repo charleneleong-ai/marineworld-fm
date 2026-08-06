@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
 from marineworld.data.contracts import VideoRecord
+
+if TYPE_CHECKING:
+    from marineworld.data.clips import AutoVideoDecoder, VideoDecoder
 
 
 @dataclass(frozen=True)
@@ -179,3 +183,23 @@ def _import_pyav() -> Any:
     except ImportError as error:
         raise VideoBackendUnavailable("PyAV is unavailable") from error
     return av
+
+
+class CachedVideoDecoder:
+    """Load pre-decoded video frames from disk, falling back to live decode on miss."""
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        fallback: VideoDecoder | None = None,
+    ) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.fallback = fallback or AutoVideoDecoder()
+
+    def decode(self, record: VideoRecord, frame_indices: Sequence[int]) -> torch.Tensor:
+        cache_path = self.cache_dir / f"{record.id}__{frame_indices[0]}.pt"
+        if cache_path.is_file():
+            frames = torch.load(cache_path, map_location="cpu", weights_only=True)
+            if frames.shape[0] == len(frame_indices):
+                return frames
+        return self.fallback.decode(record, frame_indices)
