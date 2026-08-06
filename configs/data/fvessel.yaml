@@ -18,6 +18,7 @@ ais:
 split:
   val_frac: 0.15
   test_frac: 0.15
+cache_dir: null
 transforms:
   normalization:
     mean: [0.485, 0.456, 0.406]

@@ -31,6 +31,7 @@ from marineworld.data.clips import (
 from marineworld.data.contracts import DatasetManifest
 from marineworld.data.manifest import file_checksum, manifest_checksum
 from marineworld.data.splits import prepare_manifest_splits
+from marineworld.data.video import CachedVideoDecoder
 from marineworld.train.experiment import (
     RunIdentity,
     build_run_identity,
@@ -228,6 +229,7 @@ def build_dataloaders(
         "batch_size": int(cfg.runtime.batch_size),
         "num_workers": int(cfg.runtime.num_workers),
         "persistent_workers": int(cfg.runtime.num_workers) > 0,
+        "pin_memory": torch.cuda.is_available(),
     }
     train_dataset = MaritimeClipDataset(
         split="train", color_jitter=float(cfg.data.transforms.train.color_jitter), **common
@@ -546,6 +548,9 @@ def build_decoder(cfg: DictConfig) -> VideoDecoder:
     if str(cfg.data.name) == "synthetic" or cfg.data.get("decoder") == "synthetic":
         size = int(cfg.model.image_size)
         return SyntheticVideoDecoder(size, size)
+    cache_dir = cfg.data.get("cache_dir")
+    if cache_dir:
+        return CachedVideoDecoder(Path(str(cache_dir)))
     return AutoVideoDecoder()
 
 
