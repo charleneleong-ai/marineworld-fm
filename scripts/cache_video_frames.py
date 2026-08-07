@@ -4,7 +4,8 @@ Usage:
     uv run python scripts/cache_video_frames.py \\
         --data-root /path/to/data \\
         --cache-dir /path/to/cache \\
-        --config-name config_v2
+        --config-name config_v2 \\
+        --workers 8
 
 Each clip (16 frames x 224 x 224 x 3 uint8) is saved as a single .pt file.
 Cache structure:
@@ -16,6 +17,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -58,20 +61,19 @@ def parse_args() -> argparse.Namespace:
         default=["train", "val"],
         help="Which splits to cache",
     )
+    parser.add_argument("--workers", type=int, default=8, help="Parallel decode workers")
     return parser.parse_args()
 
 
-def decode_and_cache(
-    record_id: str,
-    frame_indices: list[int],
-    split: str,
-    cache_dir: Path,
-    image_size: int,
-    records: dict[str, object],
-) -> tuple[str, bool, str]:
-    """Decode one clip and save to cache. Returns (record_id, success, error_msg)."""
+def _decode_one(args_tuple: tuple) -> tuple[str, bool, str]:
+    """Worker function: decode one clip and save to disk. Designed for multiprocessing."""
+    record_dict, frame_indices, split, cache_dir, image_size = args_tuple
+    record_id = record_dict["id"]
+
     try:
-        record = records[record_id]
+        from marineworld.data.contracts import VideoRecord
+
+        record = VideoRecord(**record_dict)
         frames = decode_video(record, tuple(frame_indices))
 
         if not isinstance(frames, torch.Tensor):
@@ -84,12 +86,12 @@ def decode_and_cache(
                 frames.float(), size=(image_size, image_size), mode="bilinear", align_corners=False
             ).to(torch.uint8)
 
-        out_path = cache_dir / split / f"{record_id}__{frame_indices[0]}.pt"
+        out_path = Path(cache_dir) / split / f"{record_id}__{frame_indices[0]}.pt"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(frames, out_path)
         return record_id, True, ""
     except Exception as exc:
-        return record_id, False, str(exc)
+        return record_id, False, str(exc)[:200]
 
 
 def main() -> None:
@@ -136,37 +138,41 @@ def main() -> None:
 
         print(f"  {split}: {len(to_cache)} to cache ({len(entries) - len(to_cache)} skipped)")
 
+        work_items = [
+            (asdict(records[rid]), fi, split, str(args.cache_dir), args.image_size)
+            for rid, fi in to_cache
+        ]
+
         t0 = time.monotonic()
         succeeded = 0
         failed = 0
+        failed_ids: list[str] = []
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            TimeElapsedColumn(),
-        ) as progress:
-            task = progress.add_task(f"  {split}", total=len(to_cache))
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(_decode_one, item): item for item in work_items}
 
-            for record_id, frame_indices in to_cache:
-                _, ok, err = decode_and_cache(
-                    record_id,
-                    frame_indices,
-                    split,
-                    args.cache_dir,
-                    args.image_size,
-                    records,
-                )
-                if ok:
-                    succeeded += 1
-                else:
-                    failed += 1
-                    if failed <= 5:
-                        print(f"    FAIL {record_id}: {err[:120]}")
-                progress.advance(task)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TimeElapsedColumn(),
+            ) as progress:
+                task = progress.add_task(f"  {split}", total=len(futures))
+
+                for future in as_completed(futures):
+                    record_id, ok, err = future.result()
+                    if ok:
+                        succeeded += 1
+                    else:
+                        failed += 1
+                        if failed <= 10:
+                            failed_ids.append(record_id)
+                    progress.advance(task)
 
         elapsed = time.monotonic() - t0
         rate = succeeded / elapsed if elapsed > 0 else 0
         print(f"  {split}: {succeeded} cached, {failed} failed ({rate:.1f} clips/sec)")
+        if failed_ids:
+            print(f"    Failed: {', '.join(failed_ids[:10])}")
 
     total_cached = sum(1 for _ in args.cache_dir.rglob("*.pt"))
     total_size_mb = sum(f.stat().st_size for f in args.cache_dir.rglob("*.pt")) / 1e6
