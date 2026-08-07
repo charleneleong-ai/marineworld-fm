@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
+from omegaconf import OmegaConf
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -31,17 +31,6 @@ from marineworld.data.manifest import manifest_checksum
 from marineworld.data.video import decode_video
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CONFIGS_DIR = REPO_ROOT / "configs"
-
-
-def load_config(config_name: str) -> DictConfig:
-    """Load a Hydra-composed config without running the main entrypoint."""
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
-
-    if not GlobalHydra.instance().is_initialized():
-        initialize_config_dir(config_dir=str(CONFIGS_DIR.resolve()), version_base=None)
-    return compose(config_name=config_name)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,10 +51,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_clip_index_for_config(
-    cfg: DictConfig,
     data_root: Path,
+    config_name: str,
 ) -> dict[str, list[tuple[str, list[int], float]]]:
     """Build clip indices for all splits, returning {split: [(record_id, frame_indices, fps)]}."""
+    cfg = OmegaConf.load(REPO_ROOT / "configs" / f"{config_name}.yaml")
     adapter = build_data_adapter(cfg.data)
     manifest = adapter.build_manifest(data_root)
     fp = manifest_checksum(manifest)
@@ -93,6 +83,8 @@ def decode_and_cache(
     frame_indices: list[int],
     split: str,
     cache_dir: Path,
+    data_root: Path,
+    config_name: str,
     image_size: int,
     records: dict[str, object],
 ) -> tuple[str, bool, str]:
@@ -122,33 +114,16 @@ def decode_and_cache(
 def main() -> None:
     args = parse_args()
 
-    print(f"Loading config {args.config_name} ...")
-    cfg = load_config(args.config_name)
-
-    print(f"Building manifest from {args.data_root} ...")
-    adapter = build_data_adapter(cfg.data)
-    manifest = adapter.build_manifest(args.data_root)
-    records = {r.id: r for r in manifest.records}
-    fp = manifest_checksum(manifest)
-
-    print("Building clip index ...")
-    clips_by_split: dict[str, list[tuple[str, list[int], float]]] = {}
-    for split in ("train", "val"):
-        clips = build_clip_index(
-            manifest,
-            split=split,
-            frames=int(cfg.model.num_frames),
-            stride=1,
-            seed=int(cfg.seed),
-            fingerprint=fp,
-        )
-        clips_by_split[split] = [
-            (clip.record_id, list(clip.frame_indices), records[clip.record_id].fps)
-            for clip in clips
-        ]
+    print(f"Building clip index from {args.data_root} ...")
+    clips_by_split = build_clip_index_for_config(args.data_root, args.config_name)
 
     total_clips = sum(len(v) for v in clips_by_split.values())
     print(f"Total clips to cache: {total_clips}")
+
+    cfg = OmegaConf.load(REPO_ROOT / "configs" / f"{args.config_name}.yaml")
+    adapter = build_data_adapter(cfg.data)
+    manifest = adapter.build_manifest(args.data_root)
+    records = {r.id: r for r in manifest.records}
 
     for split, entries in clips_by_split.items():
         split_dir = args.cache_dir / split
@@ -180,6 +155,8 @@ def main() -> None:
                     frame_indices,
                     split,
                     args.cache_dir,
+                    args.data_root,
+                    args.config_name,
                     args.image_size,
                     records,
                 )
