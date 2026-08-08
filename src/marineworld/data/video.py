@@ -206,7 +206,8 @@ class CachedVideoDecoder:
         index: dict[str, Path] = {}
         if split_dir.is_dir():
             for path in split_dir.rglob("*.pt"):
-                index[path.stem] = path
+                rel = path.relative_to(split_dir).with_suffix("")
+                index[str(rel)] = path
         return index
 
     def decode(self, record: VideoRecord, frame_indices: Sequence[int]) -> torch.Tensor:
