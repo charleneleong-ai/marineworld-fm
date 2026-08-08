@@ -1326,7 +1326,7 @@ class TestTrainingManifest:
         cfg = _compose_config("data=fvessel", "model=videomae_tiny", "runtime=local_smoke")
         monkeypatch.setattr(
             "marineworld.train.pretrain.build_decoder",
-            lambda _: SyntheticVideoDecoder(height=16, width=16),
+            lambda _cfg, _split="train": SyntheticVideoDecoder(height=16, width=16),
         )
         monkeypatch.setattr(
             FVesselAdapter,
