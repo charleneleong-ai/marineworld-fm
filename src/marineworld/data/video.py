@@ -191,13 +191,29 @@ class CachedVideoDecoder:
     def __init__(
         self,
         cache_dir: Path,
+        split: str = "train",
         fallback: VideoDecoder | None = None,
     ) -> None:
         self.cache_dir = Path(cache_dir)
+        self.split = split
         self.fallback = fallback or AutoVideoDecoder()
+        self._index: dict[str, Path] | None = None
+
+    def _build_index(self) -> dict[str, Path]:
+        split_dir = self.cache_dir / self.split
+        index: dict[str, Path] = {}
+        if split_dir.is_dir():
+            for path in split_dir.rglob("*.pt"):
+                index[path.stem] = path
+        return index
 
     def decode(self, record: VideoRecord, frame_indices: Sequence[int]) -> torch.Tensor:
-        cache_path = self.cache_dir / f"{record.id}__{frame_indices[0]}.pt"
+        if self._index is None:
+            self._index = self._build_index()
+        key = f"{record.id}__{frame_indices[0]}"
+        cache_path = self._index.get(key)
+        if cache_path is None:
+            cache_path = self.cache_dir / self.split / f"{key}.pt"
         if cache_path.is_file():
             frames = torch.load(cache_path, map_location="cpu", weights_only=True)
             if frames.shape[0] == len(frame_indices):
