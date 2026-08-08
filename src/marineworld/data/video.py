@@ -15,7 +15,7 @@ import torch
 from marineworld.data.contracts import VideoRecord
 
 if TYPE_CHECKING:
-    from marineworld.data.clips import AutoVideoDecoder, VideoDecoder
+    from marineworld.data.clips import VideoDecoder
 
 
 @dataclass(frozen=True)
@@ -196,6 +196,8 @@ class CachedVideoDecoder:
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.split = split
+        from marineworld.data.clips import AutoVideoDecoder
+
         self.fallback = fallback or AutoVideoDecoder()
         self._index: dict[str, Path] | None = None
 
