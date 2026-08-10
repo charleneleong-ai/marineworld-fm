@@ -209,13 +209,17 @@ def build_dataloaders(
     manifest: DatasetManifest,
 ) -> dict[str, DataLoader[dict[str, Any]]]:
     """Build train and validation loaders over the shared clip contract."""
-    decoder = build_decoder(cfg)
     ais_config = cfg.data.get("ais")
     max_vessels = int(ais_config.get("max_vessels", 10)) if ais_config else 10
+    loader = {
+        "batch_size": int(cfg.runtime.batch_size),
+        "num_workers": int(cfg.runtime.num_workers),
+        "persistent_workers": int(cfg.runtime.num_workers) > 0,
+        "pin_memory": torch.cuda.is_available(),
+    }
     common = {
         "manifest": manifest,
         "fingerprint": manifest_checksum(manifest),
-        "decoder": decoder,
         "frames": int(cfg.model.num_frames),
         "stride": 1,
         "image_size": int(cfg.model.image_size),
@@ -225,16 +229,13 @@ def build_dataloaders(
         "ais_config": dict(ais_config) if ais_config else None,
         "max_vessels": max_vessels,
     }
-    loader = {
-        "batch_size": int(cfg.runtime.batch_size),
-        "num_workers": int(cfg.runtime.num_workers),
-        "persistent_workers": int(cfg.runtime.num_workers) > 0,
-        "pin_memory": torch.cuda.is_available(),
-    }
     train_dataset = MaritimeClipDataset(
-        split="train", color_jitter=float(cfg.data.transforms.train.color_jitter), **common
+        split="train",
+        decoder=build_decoder(cfg, "train"),
+        color_jitter=float(cfg.data.transforms.train.color_jitter),
+        **common,
     )
-    val_dataset = MaritimeClipDataset(split="val", **common)
+    val_dataset = MaritimeClipDataset(split="val", decoder=build_decoder(cfg, "val"), **common)
     if not train_dataset:
         raise ValueError("training split produced no clips")
     if not val_dataset:
@@ -276,7 +277,9 @@ def build_trainer(
 ) -> Trainer:
     """Construct a Lightning trainer from a composed runtime profile."""
     limit = cfg.runtime.limit_train_batches
-    if num_train_batches is not None and limit >= 1:
+    if isinstance(limit, float) and limit >= 1.0 and num_train_batches is not None:
+        limit = num_train_batches
+    elif num_train_batches is not None and isinstance(limit, int) and limit >= num_train_batches:
         limit = num_train_batches
     return Trainer(
         accelerator=str(cfg.runtime.accelerator),
@@ -285,7 +288,7 @@ def build_trainer(
         max_epochs=int(cfg.train.epochs),
         max_steps=int(cfg.runtime.max_steps),
         accumulate_grad_batches=int(cfg.runtime.accumulate_grad_batches),
-        limit_train_batches=cfg.runtime.limit_train_batches,
+        limit_train_batches=limit,
         limit_val_batches=cfg.runtime.limit_val_batches,
         deterministic=True,
         logger=logger,
@@ -544,13 +547,13 @@ def _pad_and_stack(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch
     return torch.stack(padded)
 
 
-def build_decoder(cfg: DictConfig) -> VideoDecoder:
+def build_decoder(cfg: DictConfig, split: str = "train") -> VideoDecoder:
     if str(cfg.data.name) == "synthetic" or cfg.data.get("decoder") == "synthetic":
         size = int(cfg.model.image_size)
         return SyntheticVideoDecoder(size, size)
     cache_dir = cfg.data.get("cache_dir")
     if cache_dir:
-        return CachedVideoDecoder(Path(str(cache_dir)))
+        return CachedVideoDecoder(Path(str(cache_dir)), split=split)
     return AutoVideoDecoder()
 
 
