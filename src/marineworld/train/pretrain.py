@@ -277,7 +277,9 @@ def build_trainer(
 ) -> Trainer:
     """Construct a Lightning trainer from a composed runtime profile."""
     limit = cfg.runtime.limit_train_batches
-    if num_train_batches is not None and limit >= 1:
+    if isinstance(limit, float) and limit >= 1.0 and num_train_batches is not None:
+        limit = num_train_batches
+    elif num_train_batches is not None and isinstance(limit, int) and limit >= num_train_batches:
         limit = num_train_batches
     return Trainer(
         accelerator=str(cfg.runtime.accelerator),
@@ -286,7 +288,7 @@ def build_trainer(
         max_epochs=int(cfg.train.epochs),
         max_steps=int(cfg.runtime.max_steps),
         accumulate_grad_batches=int(cfg.runtime.accumulate_grad_batches),
-        limit_train_batches=cfg.runtime.limit_train_batches,
+        limit_train_batches=limit,
         limit_val_batches=cfg.runtime.limit_val_batches,
         deterministic=True,
         logger=logger,
