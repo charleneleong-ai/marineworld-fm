@@ -381,7 +381,7 @@ def _run_with_identity(
             cfg,
             logger=logger,
             callbacks=callbacks,
-            num_train_batches=len(train_loader.dataset),
+            num_train_batches=len(train_loader),
         )
         module = build_module(cfg)
         trainer.fit(
@@ -643,7 +643,7 @@ def run_maritime_pretraining(cfg: DictConfig) -> Path:
             cfg,
             logger=logger,
             callbacks=callbacks,
-            num_train_batches=len(train_loader.dataset),
+            num_train_batches=len(train_loader),
         )
         module = build_maritime_module(cfg)
         trainer.fit(
